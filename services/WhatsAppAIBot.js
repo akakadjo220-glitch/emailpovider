@@ -99,9 +99,22 @@ async function getBabipassContext() {
     events.forEach(e => {
         context += `Événement: ${e.title}\n`;
         context += `Lieu: ${e.location || 'Non précisé'}, ${e.city}\n`;
-        const eventDate = e.date ? new Date(e.date).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' }) : 'Non précisée';
-        context += `Date: ${eventDate}\n`;
-        context += `Description: ${e.description ? e.description.substring(0, 150) + '...' : 'N/A'}\n`;
+        
+        // Dates et heures
+        const startDate = e.date ? new Date(e.date).toLocaleString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Non précisée';
+        const endDate = e.end_date ? new Date(e.end_date).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : '';
+        context += `Date et heure: ${startDate}${endDate ? ' (Fin prévue vers ' + endDate + ')' : ''}\n`;
+        
+        // Description
+        context += `Description de l'événement: ${e.description ? e.description.substring(0, 600).replace(/\\n/g, ' ') + '...' : 'N/A'}\n`;
+        
+        // Programme
+        if (e.program && Array.isArray(e.program) && e.program.length > 0) {
+            context += `Programme récapitulatif :\n`;
+            e.program.forEach(p => {
+                context += ` - ${p.time}: ${p.title} ${p.description ? '(' + p.description + ')' : ''}\n`;
+            });
+        }
         
         if (e.ai_context && e.ai_context.trim().length > 0) {
             context += `Instructions Spéciales / FAQ Fournies par l'organisateur: ${e.ai_context}\n`;
@@ -111,18 +124,22 @@ async function getBabipassContext() {
             context += `Google Maps: https://www.google.com/maps/search/?api=1&query=${e.coordinates.lat},${e.coordinates.lng}\n`;
         }
 
-        context += `Billets :\n`;
+        // Billetterie et Places
+        const eventRemaining = (e.capacity || 0) - (e.sold || 0);
+        context += `PLACES GLOBALES RESTANTES pour l'événement : ${eventRemaining > 0 ? eventRemaining : 0}\n`;
+
+        context += `Détails des Tarifs (Billets) :\n`;
         const tts = ticketTypesByEvent[e.id] || [];
         if (tts.length > 0) {
             tts.forEach(tt => {
-                const remaining = (tt.quantity || tt.capacity || 0) - (tt.sold || 0);
-                context += `- ${tt.name}: ${tt.price === 0 ? 'Gratuit' : tt.price + ' FCFA'} (Reste ${remaining} place(s))\n`;
+                const ttRemaining = (tt.quantity || tt.capacity || 0) - (tt.sold || 0);
+                context += `- ${tt.name} : ${tt.price === 0 ? 'Gratuit' : tt.price + ' FCFA'} (Reste environ ${ttRemaining} unité(s) pour ce tarif)\n`;
             });
         } else {
-            context += `- Contactez l'organisateur pour les tarifs.\n`;
+            context += `- Contactez l'organisateur pour les tarifs exacts.\n`;
         }
         const linkPath = e.slug ? e.slug : e.id;
-        context += `Lien exact pour cet événement : https://babipass.com/event/${linkPath}\n\n`;
+        context += `Lien exact pour réservation : https://babipass.com/event/${linkPath}\n\n`;
     });
 
     return context;
