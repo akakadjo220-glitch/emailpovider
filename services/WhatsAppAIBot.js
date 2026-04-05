@@ -64,7 +64,7 @@ async function getBabipassContext() {
     // RAG: Fetch active events - two resilient queries to avoid join failures
     const { data: events, error } = await supabase
         .from('events')
-        .select('id, slug, title, city, location, date, description, status, ai_context, coordinates')
+        .select('*')
         .eq('status', 'published')
         .order('date', { ascending: true });
 
