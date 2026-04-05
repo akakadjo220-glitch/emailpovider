@@ -84,7 +84,7 @@ async function getBabipassContext() {
     try {
         const { data: tts, error: ttErr } = await supabase
             .from('ticket_types')
-            .select('id, event_id, name, price, capacity, sold')
+            .select('*')
             .in('event_id', eventIds);
         if (!ttErr && tts) {
             tts.forEach(tt => {
@@ -115,7 +115,7 @@ async function getBabipassContext() {
         const tts = ticketTypesByEvent[e.id] || [];
         if (tts.length > 0) {
             tts.forEach(tt => {
-                const remaining = (tt.capacity || 0) - (tt.sold || 0);
+                const remaining = (tt.quantity || tt.capacity || 0) - (tt.sold || 0);
                 context += `- ${tt.name}: ${tt.price === 0 ? 'Gratuit' : tt.price + ' FCFA'} (Reste ${remaining} place(s))\n`;
             });
         } else {
