@@ -86,8 +86,23 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ─── EMAIL RELAY (existing) ───────────────────────────────────────────────
+// ─── EMAIL QUEUE SYSTEM ──────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
+// Instead of sending immediately (blocking, rate-limit risk), we:
+//  1. Insert the email into the email_queue table
+//  2. Return 202 Accepted immediately to the caller
+//  3. A background worker picks it up and sends it gracefully
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MAX_ATTEMPTS = 5;       // Max retries before marking as 'failed'
+const BATCH_SIZE = 5;         // How many emails to process per tick
+const BATCH_DELAY_MS = 300;   // Delay between each email in the batch (avoids SMTP rate limit)
+const WORKER_INTERVAL_MS = 5000; // How often the worker polls the queue
+
+/**
+ * POST /api/send-email
+ * Pushes the email to the queue and returns immediately (non-blocking).
+ */
 app.post('/api/send-email', async (req, res) => {
     try {
         const { smtpConfig, to, subject, htmlBody } = req.body;
@@ -99,26 +114,151 @@ app.post('/api/send-email', async (req, res) => {
             return res.status(400).json({ error: 'Paramètres email manquants (to, subject, htmlBody)' });
         }
 
-        const transporter = nodemailer.createTransport({
-            host: smtpConfig.host,
-            port: smtpConfig.port || 465,
-            secure: smtpConfig.port == 465,
-            auth: { user: smtpConfig.user, pass: smtpConfig.pass },
-            tls: { rejectUnauthorized: false }
-        });
+        // Insert into queue — the worker will send it shortly
+        const { data: inserted, error: insertError } = await supabase
+            .from('email_queue')
+            .insert([{ smtp_config: smtpConfig, to_email: to, subject, html_body: htmlBody }])
+            .select('id')
+            .single();
 
-        const info = await transporter.sendMail({
-            from: `"${smtpConfig.senderName || 'Babipass'}" <${smtpConfig.user}>`,
-            to, subject, html: htmlBody,
-        });
+        if (insertError) {
+            // Fallback: if table doesn't exist yet, send directly
+            console.warn('[EmailQueue] Table not found, falling back to direct send:', insertError.message);
+            const transporter = nodemailer.createTransport({
+                host: smtpConfig.host, port: smtpConfig.port || 465,
+                secure: smtpConfig.port == 465,
+                auth: { user: smtpConfig.user, pass: smtpConfig.pass },
+                tls: { rejectUnauthorized: false }
+            });
+            const info = await transporter.sendMail({
+                from: `"${smtpConfig.senderName || 'Babipass'}" <${smtpConfig.user}>`,
+                to, subject, html: htmlBody,
+            });
+            console.log('[EmailQueue] Direct fallback sent:', info.messageId);
+            return res.status(200).json({ success: true, queued: false, messageId: info.messageId });
+        }
 
-        console.log('Email envoyé: %s', info.messageId);
-        return res.status(200).json({ success: true, messageId: info.messageId });
+        console.log(`[EmailQueue] ✅ Email mis en file d'attente (id: ${inserted?.id}) → ${to}`);
+        return res.status(202).json({ success: true, queued: true, id: inserted?.id });
+
     } catch (error) {
-        console.error('Erreur email:', error);
+        console.error('[EmailQueue] Erreur enqueue:', error);
         return res.status(500).json({ success: false, error: error.message });
     }
 });
+
+/**
+ * GET /api/email-queue/stats
+ * Returns queue statistics (for admin monitoring).
+ */
+app.get('/api/email-queue/stats', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('email_queue')
+            .select('status')
+            .in('status', ['pending', 'sent', 'failed']);
+
+        if (error) return res.status(500).json({ error: error.message });
+
+        const stats = (data || []).reduce((acc, row) => {
+            acc[row.status] = (acc[row.status] || 0) + 1;
+            return acc;
+        }, { pending: 0, sent: 0, failed: 0 });
+
+        return res.status(200).json({ success: true, stats });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+/**
+ * Core function: actually send one email via SMTP
+ */
+async function dispatchEmail(job) {
+    const { smtp_config: smtpConfig, to_email: to, subject, html_body: htmlBody } = job;
+    const transporter = nodemailer.createTransport({
+        host: smtpConfig.host,
+        port: smtpConfig.port || 465,
+        secure: smtpConfig.port == 465,
+        auth: { user: smtpConfig.user, pass: smtpConfig.pass },
+        tls: { rejectUnauthorized: false }
+    });
+    const info = await transporter.sendMail({
+        from: `"${smtpConfig.senderName || 'Babipass'}" <${smtpConfig.user}>`,
+        to, subject, html: htmlBody,
+    });
+    return info.messageId;
+}
+
+/**
+ * Background worker: runs every WORKER_INTERVAL_MS.
+ * Picks up to BATCH_SIZE pending emails, sends them one by one,
+ * with BATCH_DELAY_MS pause between each to avoid SMTP rate limits.
+ */
+async function emailQueueWorker() {
+    try {
+        // Fetch pending jobs (oldest first, only those with attempts left)
+        const { data: jobs, error } = await supabase
+            .from('email_queue')
+            .select('*')
+            .eq('status', 'pending')
+            .lt('attempts', MAX_ATTEMPTS)
+            .order('created_at', { ascending: true })
+            .limit(BATCH_SIZE);
+
+        if (error) {
+            // Silently ignore if table doesn't exist yet
+            if (error.code === '42P01') return;
+            console.error('[EmailQueue Worker] Fetch error:', error.message);
+            return;
+        }
+
+        if (!jobs || jobs.length === 0) return;
+
+        console.log(`[EmailQueue Worker] 📬 Processing ${jobs.length} email(s)...`);
+
+        for (const job of jobs) {
+            try {
+                // Mark as in-progress (increment attempts first to avoid duplicate sends on crash)
+                await supabase
+                    .from('email_queue')
+                    .update({ attempts: job.attempts + 1 })
+                    .eq('id', job.id);
+
+                const messageId = await dispatchEmail(job);
+
+                // Success → mark as sent
+                await supabase
+                    .from('email_queue')
+                    .update({ status: 'sent', processed_at: new Date().toISOString(), error_msg: null })
+                    .eq('id', job.id);
+
+                console.log(`[EmailQueue Worker] ✅ Sent to ${job.to_email} (msgId: ${messageId})`);
+
+            } catch (sendErr) {
+                const newAttempts = job.attempts + 1;
+                const newStatus = newAttempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
+
+                await supabase
+                    .from('email_queue')
+                    .update({ attempts: newAttempts, status: newStatus, error_msg: sendErr.message })
+                    .eq('id', job.id);
+
+                if (newStatus === 'failed') {
+                    console.error(`[EmailQueue Worker] ❌ FAILED permanently for ${job.to_email} after ${newAttempts} attempts: ${sendErr.message}`);
+                } else {
+                    console.warn(`[EmailQueue Worker] ⚠️  Retry ${newAttempts}/${MAX_ATTEMPTS} for ${job.to_email}: ${sendErr.message}`);
+                }
+            }
+
+            // Wait between emails to avoid SMTP rate limiting
+            await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+        }
+
+    } catch (err) {
+        console.error('[EmailQueue Worker] Unexpected error:', err.message);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ─── AUTHENTICATION (Password Reset via OTP) ─────────────────────────────
@@ -1177,3 +1317,13 @@ setInterval(runEventLifecycleCron, 60 * 60 * 1000);
 // Run reminder cron immediately on startup, then every 24 hours
 runReminderCron();
 setInterval(runReminderCron, 24 * 60 * 60 * 1000);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── EMAIL QUEUE WORKER (starts with the server) ─────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// Small initial delay (3s) to let the server fully start before first poll
+setTimeout(() => {
+    console.log('[EmailQueue Worker] 🚀 Démarrage du worker email (intervalle: 5s, batch: 5)');
+    emailQueueWorker(); // Run immediately
+    setInterval(emailQueueWorker, WORKER_INTERVAL_MS);
+}, 3000);
