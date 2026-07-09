@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
@@ -33,9 +35,31 @@ async function getSetting(key) {
     return data.value;
 }
 
+// ─── Rate Limiters ─────────────────────────────────────────────────────────
+const globalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 1000, // Limit each IP to 1000 requests per 15 mins
+    message: { success: false, error: "Trop de requêtes. Veuillez réessayer plus tard." },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 50, // Limit each IP to 50 login/OTP attempts per 15 mins
+    message: { success: false, error: "Trop de tentatives d'authentification. Veuillez réessayer dans 15 minutes." },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
 // Middleware
+app.use(helmet());
 app.use(cors());
 app.use(express.json());
+
+// Apply limiters
+app.use('/api/', globalLimiter);
+app.use('/api/auth/', authLimiter);
 
 // ─── Health ────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
