@@ -19,8 +19,8 @@ CREATE INDEX IF NOT EXISTS idx_transactions_created_at
   ON transactions(created_at DESC);
 
 -- 3. Optimisations pour la table 'email_queue'
-CREATE INDEX IF NOT EXISTS idx_email_queue_status_sent 
-  ON email_queue(status, sent_at) 
+CREATE INDEX IF NOT EXISTS idx_email_queue_pending 
+  ON email_queue(status, created_at) 
   WHERE status = 'pending';
 
 -- 4. Optimisations pour la table 'auth_otps'
