@@ -33,3 +33,10 @@ CREATE INDEX IF NOT EXISTS idx_profiles_email
 
 CREATE INDEX IF NOT EXISTS idx_profiles_phone 
   ON profiles(phone);
+
+-- 6. Optimisations pour la table 'events'
+CREATE INDEX IF NOT EXISTS idx_events_status 
+  ON events(status);
+
+CREATE INDEX IF NOT EXISTS idx_events_organizer_id 
+  ON events(organizer_id);
