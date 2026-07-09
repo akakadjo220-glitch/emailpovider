@@ -3,6 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 const { createClient } = require('@supabase/supabase-js');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -82,6 +84,90 @@ app.post('/api/chat', async (req, res) => {
     } catch (err) {
         console.error('[Web Chat Error]', err);
         res.status(500).json({ error: 'Erreur interne du serveur' });
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── CHEVERETO MEDIA UPLOAD & VERIFICATION PROXY ──────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/api/upload', upload.single('source'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'Aucun fichier fourni' });
+        }
+
+        // Récupérer la configuration Chevereto
+        const config = await getSetting('chevereto_config');
+        if (!config || !config.enabled) {
+            return res.status(400).json({ error: 'L\'hébergement Chevereto n\'est pas activé' });
+        }
+
+        const { apiUrl, apiKey } = config;
+        if (!apiUrl || !apiKey) {
+            return res.status(400).json({ error: 'Configuration Chevereto incomplète (URL ou Clé API manquante)' });
+        }
+
+        // Préparer le téléversement vers Chevereto
+        const formData = new FormData();
+        const fileBlob = new Blob([req.file.buffer], { type: req.file.mimetype });
+        formData.append('source', fileBlob, req.file.originalname);
+
+        console.log(`[Chevereto Upload] Envoi du fichier ${req.file.originalname} vers ${apiUrl}...`);
+
+        const response = await fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+                'X-API-Key': apiKey
+            },
+            body: formData
+        });
+
+        const text = await response.text();
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch (e) {
+            console.error('[Chevereto Upload] Response is not JSON:', text);
+            return res.status(500).json({ error: 'Réponse invalide du serveur Chevereto', details: text });
+        }
+
+        if (!response.ok || data.status_code !== 200) {
+            console.error('[Chevereto Upload] Error details:', data);
+            return res.status(response.status || 500).json({ 
+                error: (data.error && data.error.message) || 'Échec du téléversement sur Chevereto',
+                details: data
+            });
+        }
+
+        // Chevereto v1/v1.1 retourne l'URL directe dans data.image.url ou data.image.direct_url
+        const imageUrl = data.image?.url || data.image?.direct_url;
+        console.log(`[Chevereto Upload] Succès ! Fichier disponible sur : ${imageUrl}`);
+
+        res.status(200).json({ url: imageUrl, details: data });
+    } catch (err) {
+        console.error('[Chevereto Upload Error]', err);
+        res.status(500).json({ error: err.message || 'Erreur interne lors de l\'upload' });
+    }
+});
+
+app.get('/api/upload/check', async (req, res) => {
+    try {
+        const { url } = req.query;
+        if (!url) {
+            return res.status(400).json({ error: 'URL manquante' });
+        }
+
+        console.log(`[Chevereto Check] Vérification de l'URL : ${url}`);
+        const response = await fetch(url, { method: 'HEAD' });
+
+        if (response.ok) {
+            res.status(200).json({ exists: true, contentType: response.headers.get('content-type') });
+        } else {
+            res.status(404).json({ exists: false, status: response.status });
+        }
+    } catch (err) {
+        console.error('[Chevereto Check Error]', err);
+        res.status(500).json({ error: err.message });
     }
 });
 
