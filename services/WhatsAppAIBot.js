@@ -27,36 +27,89 @@ const RATE_LIMIT_MAP = new Map(); // phone -> last_message_time
 
 async function sendWaSenderMessage(to, text) {
     const waConfig = await getSetting('wa_config');
-    const WASENDER_URL = waConfig?.wasenderUrl;
-    const WASENDER_API_KEY = waConfig?.token;
-
-    if (!WASENDER_URL || !WASENDER_API_KEY) {
-        console.warn('[WhatsApp Bot] WaSender non configuré dans l\'admin. Simulation. Message pour:', to, '| Texte:', text.substring(0, 50) + '...');
+    if (!waConfig) {
+        console.warn("[WhatsApp Bot] Config wa_config introuvable dans la base de données.");
         return;
     }
 
-    // Convert to proper WaSender format
-    // Many WaSender APIs use POST /sendText with JSON { number, text, apikey }
-    // Or /api/sendText with bearer token. We will try a flexible approach.
+    const provider = waConfig.provider || 'wasender';
+    const cleanPhone = to.replace(/[^0-9]/g, '');
+
     try {
-        const payload = {
-            number: to,
-            text: text,
-            apikey: WASENDER_API_KEY
-        };
-        const res = await fetch(`${WASENDER_URL}/sendText`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${WASENDER_API_KEY}` // Depending on API version
-            },
-            body: JSON.stringify(payload)
-        });
-        const data = await res.json();
-        console.log(`[WhatsApp Bot] Message envoyé à ${to}. Status: ${res.status}`);
-        return data;
+        if (provider === 'openwa') {
+            const { openwaUrl, openwaSessionId, openwaToken } = waConfig;
+            if (!openwaUrl || !openwaSessionId) {
+                console.warn("[WhatsApp Bot] Configuration Open WA incomplète.");
+                return;
+            }
+            console.log(`[WhatsApp Bot/OpenWA] Envoi du message à ${cleanPhone} via Session ${openwaSessionId}...`);
+            const res = await fetch(`${openwaUrl}/api/sessions/${openwaSessionId}/messages/send-text`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(openwaToken ? { 'X-API-Key': openwaToken } : {})
+                },
+                body: JSON.stringify({
+                    chatId: `${cleanPhone}@c.us`,
+                    text: text
+                })
+            });
+            const data = await res.json().catch(() => ({}));
+            console.log(`[WhatsApp Bot/OpenWA] Réponse :`, data);
+            return data;
+        } else if (provider === 'evolution') {
+            const { evolutionUrl, evolutionInstance, evolutionApiKey } = waConfig;
+            if (!evolutionUrl || !evolutionInstance || !evolutionApiKey) {
+                console.warn("[WhatsApp Bot] Configuration Evolution API incomplète.");
+                return;
+            }
+            console.log(`[WhatsApp Bot/Evolution] Envoi du message à ${cleanPhone} via Instance ${evolutionInstance}...`);
+            const res = await fetch(`${evolutionUrl}/message/sendText/${evolutionInstance}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'apikey': evolutionApiKey
+                },
+                body: JSON.stringify({
+                    number: cleanPhone,
+                    textMessage: { text: text }
+                })
+            });
+            const data = await res.json().catch(() => ({}));
+            console.log(`[WhatsApp Bot/Evolution] Réponse :`, data);
+            return data;
+        } else {
+            // Default: wasender
+            const WASENDER_URL = waConfig.wasenderUrl || 'https://wasenderapi.com/api/send-message';
+            const WASENDER_API_KEY = waConfig.token;
+            if (!WASENDER_API_KEY) {
+                console.warn("[WhatsApp Bot] Clé API/Token WaSender manquante.");
+                return;
+            }
+
+            console.log(`[WhatsApp Bot/WaSender] Envoi du message à ${cleanPhone}...`);
+            const url = WASENDER_URL.includes('wasenderapi.com')
+                ? `${WASENDER_URL}?instance_id=${waConfig.instanceId}`
+                : `${WASENDER_URL}/sendText`;
+
+            const payload = WASENDER_URL.includes('wasenderapi.com')
+                ? { to: cleanPhone, text: text }
+                : { number: cleanPhone, text: text, apikey: WASENDER_API_KEY };
+
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${WASENDER_API_KEY}`
+                },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json().catch(() => ({}));
+            console.log(`[WhatsApp Bot/WaSender] Réponse :`, data);
+            return data;
+        }
     } catch (err) {
-        console.error('[WhatsApp Bot] Erreur d\'envoi WaSender:', err.message);
+        console.error('[WhatsApp Bot] Erreur d\'envoi WhatsApp :', err.message);
     }
 }
 
