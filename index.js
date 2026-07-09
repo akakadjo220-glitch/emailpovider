@@ -257,6 +257,35 @@ app.post('/api/send-email', async (req, res) => {
     }
 });
 
+app.post('/api/send-whatsapp', async (req, res) => {
+    try {
+        const { phone, message, mediaUrl } = req.body;
+
+        if (!phone || !message) {
+            return res.status(400).json({ error: 'Paramètres WhatsApp manquants (phone, message)' });
+        }
+
+        // Insert into queue
+        const { data: inserted, error: insertError } = await supabase
+            .from('whatsapp_queue')
+            .insert([{ phone, message, media_url: mediaUrl }])
+            .select('id')
+            .single();
+
+        if (insertError) {
+            console.error('[WhatsAppQueue] DB insert failed:', insertError.message);
+            return res.status(500).json({ success: false, error: insertError.message });
+        }
+
+        console.log(`[WhatsAppQueue] ✅ Message mis en file d'attente (id: ${inserted?.id}) → ${phone}`);
+        return res.status(202).json({ success: true, queued: true, id: inserted?.id });
+
+    } catch (error) {
+        console.error('[WhatsAppQueue] Erreur enqueue:', error);
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 /**
  * GET /api/email-queue/stats
  * Returns queue statistics (for admin monitoring).
@@ -367,6 +396,172 @@ async function emailQueueWorker() {
 
     } catch (err) {
         console.error('[EmailQueue Worker] Unexpected error:', err.message);
+    }
+}
+
+async function dispatchWhatsApp(job) {
+    const { phone, message, media_url: mediaUrl } = job;
+    const cleanPhone = phone.replace(/[^0-9]/g, '');
+
+    const waConfig = await getSetting('wa_config');
+    if (!waConfig) {
+        throw new Error("wa_config manquante ou incomplète sur la plateforme.");
+    }
+
+    if (waConfig.provider === 'openwa') {
+        if (!waConfig.openwaUrl || !waConfig.openwaSessionId) {
+            throw new Error("Configuration Open WA API incomplète.");
+        }
+        
+        let url = `${waConfig.openwaUrl}/api/sessions/${waConfig.openwaSessionId}/messages/send-text`;
+        let payload = { chatId: `${cleanPhone}@c.us`, text: message };
+        
+        if (mediaUrl) {
+            url = `${waConfig.openwaUrl}/api/sessions/${waConfig.openwaSessionId}/messages/send-image`;
+            payload = {
+                chatId: `${cleanPhone}@c.us`,
+                url: mediaUrl,
+                caption: message,
+                filename: 'ticket.png'
+            };
+        }
+
+        const fetchOptions = {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(waConfig.openwaToken ? { 'X-API-Key': waConfig.openwaToken } : {})
+            },
+            body: JSON.stringify(payload)
+        };
+
+        const response = await fetch(url, fetchOptions);
+        if (!response.ok) {
+            const errBody = await response.text().catch(() => '');
+            throw new Error(`Open WA Error (${response.status}): ${errBody || response.statusText}`);
+        }
+        return await response.json();
+
+    } else if (waConfig.provider === 'evolution') {
+        if (!waConfig.evolutionUrl || !waConfig.evolutionInstance || !waConfig.evolutionApiKey) {
+            throw new Error("Configuration Evolution API incomplète.");
+        }
+
+        let url = `${waConfig.evolutionUrl}/message/sendText/${waConfig.evolutionInstance}`;
+        let payload = { number: cleanPhone, textMessage: { text: message } };
+
+        if (mediaUrl) {
+            url = `${waConfig.evolutionUrl}/message/sendMedia/${waConfig.evolutionInstance}`;
+            payload = {
+                number: cleanPhone,
+                mediaMessage: {
+                    mediatype: 'image',
+                    caption: message,
+                    media: mediaUrl
+                }
+            };
+        }
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'apikey': waConfig.evolutionApiKey
+            },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            throw new Error(`Evolution API Error: ${response.statusText}`);
+        }
+        return await response.json();
+
+    } else {
+        if (!waConfig.token || !waConfig.instanceId) {
+            throw new Error("WaSender Token ou Instance ID manquant.");
+        }
+
+        let url = `https://wasenderapi.com/api/send-message?instance_id=${waConfig.instanceId}`;
+        let payload = { to: cleanPhone, text: message };
+
+        if (mediaUrl) {
+            payload = {
+                to: cleanPhone,
+                text: message,
+                caption: message,
+                imageUrl: mediaUrl
+            };
+        }
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${waConfig.token}`
+            },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            const errBody = await response.text().catch(() => '');
+            throw new Error(`WaSender Error (${response.status}): ${errBody}`);
+        }
+        return await response.json();
+    }
+}
+
+async function whatsappQueueWorker() {
+    try {
+        const { data: jobs, error } = await supabase
+            .from('whatsapp_queue')
+            .select('*')
+            .eq('status', 'pending')
+            .lt('attempts', MAX_ATTEMPTS)
+            .order('created_at', { ascending: true })
+            .limit(BATCH_SIZE);
+
+        if (error) {
+            if (error.code === '42P01') return; // Table not created yet
+            console.error('[WhatsAppQueue Worker] Fetch error:', error.message);
+            return;
+        }
+
+        if (!jobs || jobs.length === 0) return;
+
+        console.log(`[WhatsAppQueue Worker] 💬 Processing ${jobs.length} whatsapp message(s)...`);
+
+        for (const job of jobs) {
+            try {
+                await dispatchWhatsApp(job);
+                
+                await supabase
+                    .from('whatsapp_queue')
+                    .update({ status: 'sent', processed_at: new Date().toISOString() })
+                    .eq('id', job.id);
+
+                console.log(`[WhatsAppQueue Worker] ✅ Sent to ${job.phone}`);
+
+            } catch (sendErr) {
+                const newAttempts = job.attempts + 1;
+                const newStatus = newAttempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
+
+                await supabase
+                    .from('whatsapp_queue')
+                    .update({ attempts: newAttempts, status: newStatus, error_msg: sendErr.message })
+                    .eq('id', job.id);
+
+                if (newStatus === 'failed') {
+                    console.error(`[WhatsAppQueue Worker] ❌ FAILED permanently for ${job.phone} after ${newAttempts} attempts: ${sendErr.message}`);
+                } else {
+                    console.warn(`[WhatsAppQueue Worker] ⚠️  Retry ${newAttempts}/${MAX_ATTEMPTS} for ${job.phone}: ${sendErr.message}`);
+                }
+            }
+
+            await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+        }
+
+    } catch (err) {
+        console.error('[WhatsAppQueue Worker] Unexpected error:', err.message);
     }
 }
 
@@ -1436,6 +1631,10 @@ setTimeout(() => {
     console.log('[EmailQueue Worker] 🚀 Démarrage du worker email (intervalle: 5s, batch: 5)');
     emailQueueWorker(); // Run immediately
     setInterval(emailQueueWorker, WORKER_INTERVAL_MS);
+
+    console.log('[WhatsAppQueue Worker] 🚀 Démarrage du worker WhatsApp (intervalle: 5s, batch: 5)');
+    whatsappQueueWorker(); // Run immediately
+    setInterval(whatsappQueueWorker, WORKER_INTERVAL_MS);
 }, 3000);
 
 // ─── Process Level Error Handling (Robustness) ─────────────────────────────
