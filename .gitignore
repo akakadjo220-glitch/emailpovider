@@ -1,2 +1,9 @@
 node_modules/
 .env
+
+# Sauvegardes et scripts de test / débogage (peuvent contenir des secrets)
+*.bak-phase0
+test_*.js
+test_*.cjs
+test_out.txt
+trigger_webhook.js

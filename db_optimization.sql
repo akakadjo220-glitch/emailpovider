@@ -11,6 +11,9 @@ CREATE INDEX IF NOT EXISTS idx_tickets_event_id_status
 CREATE INDEX IF NOT EXISTS idx_tickets_guest_email 
   ON tickets(guest_email);
 
+CREATE INDEX IF NOT EXISTS idx_tickets_qr_code
+  ON tickets(qr_code);
+
 -- 2. Optimisations pour la table 'transactions'
 CREATE INDEX IF NOT EXISTS idx_transactions_event_id_status 
   ON transactions(event_id, status);
