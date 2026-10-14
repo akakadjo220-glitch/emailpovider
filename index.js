@@ -1082,11 +1082,23 @@ app.post('/api/webhooks/didit', async (req, res) => {
 
         const session_id = body.session_id || decision?.session_id || null;
 
-        // Extract the strict overarching status from the payload
-        const topLevelStatus = String(body.status || decision?.status || '').toLowerCase();
-        let isApproved = topLevelStatus === 'approved';
+        // Seuls les changements de statut de session comptent ; les autres événements
+        // Didit (data.updated, activity.created, transaction.*, …) ne modifient rien.
+        const webhookType = String(body.webhook_type || '').toLowerCase();
+        if (webhookType && webhookType !== 'status.updated') {
+            return res.status(200).json({ success: true, message: `Event ${webhookType} ignored` });
+        }
 
-        const status = isApproved ? 'verified' : 'rejected';
+        // Seule une décision finale change le profil : « Approved » → vérifié,
+        // « Declined » → rejeté. Les statuts intermédiaires (Not Started, In Progress,
+        // In Review, …) ne doivent jamais rejeter un organisateur.
+        const topLevelStatus = String(body.status || decision?.status || '').toLowerCase();
+        const FINAL_STATUSES = { approved: 'verified', declined: 'rejected' };
+        const status = FINAL_STATUSES[topLevelStatus];
+        if (!status) {
+            console.log(`[Didit Webhook] Statut intermédiaire « ${topLevelStatus || 'vide'} » pour ${user_id} : aucune modification.`);
+            return res.status(200).json({ success: true, message: 'Non-final status ignored' });
+        }
 
         // Standard direct robust update (guaranteed to be correct since we rely on vendor_data)
         const { error } = await supabase.rpc('verify_organizer', {
