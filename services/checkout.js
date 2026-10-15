@@ -168,6 +168,46 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
         return data;
     }
 
+    // ─── Moyens de paiement réellement utilisables ──────────────────────────
+    // Un moyen est proposé seulement s'il est activé dans l'admin (payment_toggles)
+    // ET que ses clés sont saisies : jamais de bouton qui mène à une erreur.
+    // La vérification des paiements déjà lancés n'en dépend pas.
+    const PROVIDER_READY = {
+        paystack: c => !!(c?.publicKey && c?.secretKey),
+        pawapay: c => !!c?.jwtToken,
+        feexpay: c => !!(c?.shopId && c?.token),
+        intouch: c => !!(c?.partnerId && c?.login && c?.password),
+        paydunya: c => !!(c?.masterKey && c?.privateKey && c?.token),
+    };
+    let availability = { at: 0, value: null };
+
+    async function availablePayments() {
+        if (availability.value && Date.now() - availability.at < 30 * 1000) return availability.value;
+        const toggles = (await getSetting('payment_toggles')) || {};
+        const configs = {};
+        const providers = {};
+        await Promise.all(Object.entries(PROVIDER_READY).map(async ([id, ready]) => {
+            configs[id] = await getSetting(`${id}_config`);
+            providers[id] = toggles[id] !== false && ready(configs[id]);
+        }));
+        if (TEST_PAYMENTS_ENABLED) providers.loadtest = true;
+        const value = {
+            providers,
+            // Paystack peut aussi encaisser le Mobile Money (Wave, Orange…) dans sa
+            // fenêtre ; « mobileMoney: false » dans paystack_config le désactive.
+            paystackMobileMoney: providers.paystack && configs.paystack?.mobileMoney !== false,
+        };
+        availability = { at: Date.now(), value };
+        return value;
+    }
+
+    async function providerUnavailable(res, provider) {
+        const { providers } = await availablePayments();
+        if (providers[provider]) return false;
+        res.status(400).json({ success: false, code: 'PROVIDER_UNAVAILABLE', error: "Ce moyen de paiement n'est pas disponible pour le moment. Choisissez-en un autre." });
+        return true;
+    }
+
     async function resolvePawapayTarget(baseUrl, token, payment) {
         const requested = String(payment.network || 'ORANGE_CI').toUpperCase();
         const [operator, countryCode = 'CI'] = requested.split('_');
@@ -541,6 +581,21 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
      *   buyer: {name, email?, phone?, contact_method}, buyer_location?, referral_code?,
      *   payment: {phone?, network?, countryCode?} }
      */
+    /**
+     * GET /api/public/payment-methods — moyens de paiement utilisables (activés
+     * ET configurés). Le site n'affiche que ceux-là, pour tous les parcours.
+     */
+    app.get('/api/public/payment-methods', async (req, res) => {
+        try {
+            const { providers, paystackMobileMoney } = await availablePayments();
+            res.set('Cache-Control', 'public, max-age=30, s-maxage=30');
+            return res.json({ success: true, providers, paystack_mobile_money: paystackMobileMoney });
+        } catch (err) {
+            console.error('[Checkout] Moyens de paiement illisibles:', err.message);
+            return res.status(500).json({ success: false, error: 'Indisponible.' });
+        }
+    });
+
     app.post('/api/checkout/orders', checkoutLimiter, async (req, res) => {
         try {
             const { event_id, items, payment_mode = 'full', provider, buyer = {}, buyer_location = null, referral_code = null, payment = {} } = req.body || {};
@@ -548,6 +603,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
             if (!isUuid(event_id) || !PROVIDERS.includes(provider) || !items || typeof items !== 'object') {
                 return res.status(400).json({ success: false, error: 'Commande invalide.' });
             }
+            if (await providerUnavailable(res, provider)) return;
             const itemList = Object.entries(items)
                 .map(([id, qty]) => ({ id, qty: Number(qty) }))
                 .filter(i => i.qty > 0);
@@ -613,6 +669,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
 
     async function createAndPay(res, rpcName, rpcArgs, provider, payment) {
         if (!PROVIDERS.includes(provider)) return res.status(400).json({ success: false, error: 'Moyen de paiement invalide.' });
+        if (await providerUnavailable(res, provider)) return;
         const paymentInput = cleanPaymentInput(provider, payment);
         if (!paymentInput) return res.status(400).json({ success: false, error: 'Numéro Mobile Money invalide.' });
 
