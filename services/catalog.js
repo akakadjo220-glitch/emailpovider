@@ -179,7 +179,7 @@ function registerCatalogRoutes(app, { supabase }) {
                 const run = async (withCountry) => {
                     let query = supabase
                         .from('events')
-                        .select('id, slug, title, date, image, price, currency, category, city, country, location, status, ticket_types(price)')
+                        .select('id, slug, title, date, image, price, currency, category, city, country, location, status, sold, capacity, ticket_types(price)')
                         .eq('status', 'completed')
                         .order('date', { ascending: false })
                         .limit(8);
