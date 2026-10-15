@@ -774,6 +774,68 @@ app.post('/api/auth/otp/verify', async (req, res) => {
     }
 });
 
+// ─── Recherche de compte (la table profiles n'est plus lisible publiquement) ──
+// Comptes « mode téléphone » : e-mail technique <numéro>@organizer.babipass.local,
+// ou numéro dans le nom. Seuls des chiffres entrent dans le filtre PostgREST.
+function phoneCandidates(rawInput, fullPhone) {
+    const digits = v => String(v || '').replace(/\D/g, '');
+    const raw = digits(rawInput);
+    const full = digits(fullPhone);
+    return {
+        email: [...new Set([full, raw, raw.replace(/^0+/, '')])].filter(d => d.length >= 6),
+        name: [...new Set([full, raw])].filter(d => d.length >= 6),
+    };
+}
+
+async function findProfilesByPhone(rawInput, fullPhone, columns, limit) {
+    const c = phoneCandidates(rawInput, fullPhone);
+    if (c.email.length === 0) return [];
+    const filters = [...c.email.map(d => `email.like.%${d}%`), ...c.name.map(d => `name.like.%${d}%`)];
+    const { data, error } = await supabase.from('profiles').select(columns).or(filters.join(',')).limit(limit);
+    if (error) throw error;
+    return data || [];
+}
+
+/**
+ * POST /api/auth/resolve-phone  { phone, full_phone }
+ * Connexion / mot de passe oublié en mode téléphone : renvoie l'e-mail du compte.
+ */
+app.post('/api/auth/resolve-phone', async (req, res) => {
+    try {
+        const profiles = await findProfilesByPhone(req.body.phone, req.body.full_phone, 'email', 1);
+        if (profiles.length === 0 || !profiles[0].email) {
+            return res.status(404).json({ success: false, error: 'Aucun compte trouvé avec ce numéro de téléphone.' });
+        }
+        return res.status(200).json({ success: true, email: profiles[0].email });
+    } catch (err) {
+        console.error('[resolve-phone] Error:', err);
+        return res.status(500).json({ success: false, error: 'Erreur lors de la recherche du compte.' });
+    }
+});
+
+/**
+ * POST /api/auth/account-exists  { email } | { phone, full_phone }
+ * Avant inscription : indique seulement si le compte existe déjà.
+ */
+app.post('/api/auth/account-exists', async (req, res) => {
+    try {
+        let exists;
+        if (req.body.phone) {
+            exists = (await findProfilesByPhone(req.body.phone, req.body.full_phone, 'id', 1)).length > 0;
+        } else {
+            const email = normalizeIdentifier(req.body.email);
+            if (!email) return res.status(400).json({ success: false, error: 'Email ou numéro requis.' });
+            const { data, error } = await supabase.from('profiles').select('id').ilike('email', escapeLike(email)).limit(1);
+            if (error) throw error;
+            exists = (data || []).length > 0;
+        }
+        return res.status(200).json({ success: true, exists });
+    } catch (err) {
+        console.error('[account-exists] Error:', err);
+        return res.status(500).json({ success: false, error: 'Erreur lors de la vérification du compte.' });
+    }
+});
+
 // ─── Password Reset via OTP ───────────────────────────────────────────────
 app.post('/api/auth/reset-password', async (req, res) => {
     try {
