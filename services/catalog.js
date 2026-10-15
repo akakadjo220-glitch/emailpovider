@@ -166,6 +166,54 @@ function registerCatalogRoutes(app, { supabase }) {
             return res.status(500).json({ success: false, error: 'Événement indisponible.' });
         }
     });
+
+    /**
+     * GET /api/public/highlights?country=…  — derniers événements terminés, pour
+     * que l'accueil ne soit jamais vide quand rien n'est à venir. Si le pays n'en
+     * a pas, on prend ceux de tous les pays.
+     */
+    app.get('/api/public/highlights', async (req, res) => {
+        try {
+            const country = String(req.query.country || 'Global').slice(0, 60);
+            const events = await cache.get(`highlights:${country}`, 5 * 60 * 1000, async () => {
+                const run = async (withCountry) => {
+                    let query = supabase
+                        .from('events')
+                        .select('id, slug, title, date, image, price, currency, category, city, country, location, status, ticket_types(price)')
+                        .eq('status', 'completed')
+                        .order('date', { ascending: false })
+                        .limit(8);
+                    if (withCountry) query = query.eq('country', country);
+                    const { data, error } = await query;
+                    if (error) throw error;
+                    return data || [];
+                };
+                const local = country !== 'Global' ? await run(true) : [];
+                return local.length > 0 ? local : run(false);
+            });
+            setPublicCache(res, 300, 600);
+            return res.json({ success: true, events });
+        } catch (err) {
+            console.error('[Catalog] Moments forts échoués:', err.message);
+            return res.status(500).json({ success: false, error: 'Indisponible.' });
+        }
+    });
+
+    /** GET /api/public/stats — chiffres publics (billets émis), mis en cache 1 h. */
+    app.get('/api/public/stats', async (req, res) => {
+        try {
+            const stats = await cache.get('stats', 60 * 60 * 1000, async () => {
+                const { count, error } = await supabase.from('tickets').select('id', { count: 'estimated', head: true });
+                if (error) throw error;
+                return { tickets_issued: count || 0 };
+            });
+            setPublicCache(res, 3600, 3600);
+            return res.json({ success: true, ...stats });
+        } catch (err) {
+            console.error('[Catalog] Statistiques échouées:', err.message);
+            return res.status(500).json({ success: false, error: 'Indisponible.' });
+        }
+    });
 }
 
 module.exports = { registerCatalogRoutes, createMicroCache, sanitizeSearch };
