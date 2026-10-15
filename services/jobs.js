@@ -14,6 +14,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const { createHealthAlerts } = require('./alerts');
 
 const MAX_ATTEMPTS = 5;
 const QUEUE_BATCH = Number(process.env.QUEUE_BATCH || 50);
@@ -135,6 +136,8 @@ function createWorker({ supabase, getSetting, getSmtpConfig, dispatchWhatsApp, c
         loops.push(loop);
     }
 
+    const runHealthAlerts = createHealthAlerts({ supabase });
+
     // ─── Tâches planifiées sous verrou ───────────────────────────────────
     const scheduled = [
         { name: 'reconcile-orders', minIntervalS: 25, ttlS: 300, run: () => checkout.reconcile() },
@@ -143,6 +146,8 @@ function createWorker({ supabase, getSetting, getSmtpConfig, dispatchWhatsApp, c
         { name: 'event-reminders', minIntervalS: 3500, ttlS: 1800, run: runReminders },
         { name: 'purge-operational-data', minIntervalS: 86000, ttlS: 600, run: runPurge },
         { name: 'ensure-archive-partitions', minIntervalS: 86000, ttlS: 300, run: runEnsurePartitions },
+        // Alertes d'exploitation (paiements bloqués, e-mails en panne…) : voir services/alerts.js.
+        { name: 'health-alerts', minIntervalS: 290, ttlS: 120, run: runHealthAlerts },
         // Archivage des vieux événements : désactivé par défaut (ARCHIVE_ENABLED=true pour l'activer).
         ...(process.env.ARCHIVE_ENABLED === 'true'
             ? [{ name: 'archive-events', minIntervalS: 82800, ttlS: 3600, run: runArchive }]

@@ -131,6 +131,27 @@ app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', service: 'AfriTix Payment & SMTP Relay', version: '2.0.0' });
 });
 
+// ─── Erreurs JavaScript des navigateurs ────────────────────────────────────
+// Une page qui plante chez un client devient visible dans les logs (et Sentry si
+// actif) au lieu de passer inaperçue. Données tronquées, aucune donnée personnelle.
+const clientErrorLimiter = sharedRateLimit({
+    prefix: 'client-errors',
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.post('/api/client-errors', clientErrorLimiter, (req, res) => {
+    const body = req.body || {};
+    const clip = (value, max) => String(value || '').replace(/[\r\n]+/g, ' ').slice(0, max);
+    const message = clip(body.message, 300);
+    const page = clip(body.page, 200).replace(/[?#].*$/, ''); // sans paramètres (jetons éventuels)
+    const stack = String(body.stack || '').slice(0, 1500);
+    console.error(`[Client] ${message} — page ${page} — ${clip(req.get('user-agent'), 120)}\n${stack}`);
+    if (Sentry) Sentry.captureMessage(`[Client] ${message}`, { level: 'error', extra: { page, stack } });
+    res.status(204).end();
+});
+
 // ─── Dynamic XML Sitemap for Search Engines & AI Bots (SEO Engine) ──────────
 let sitemapCache = null;
 let sitemapCacheExpiry = 0;
