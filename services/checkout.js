@@ -147,6 +147,51 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
         }
     }
 
+    // ─── PawaPay : code opérateur et numéro au format attendu ────────────────
+    // Le site envoie un choix lisible (« WAVE_CI », « ORANGE_CI »…) et le numéro
+    // tel que saisi (« 0700000000 »). PawaPay attend son propre code opérateur
+    // (pays en 3 lettres, ex. MTN_MOMO_ZMB) et le numéro international sans « + ».
+    // On lit les opérateurs réellement activés sur le compte (GET /active-conf,
+    // mis en cache 1 h) plutôt que de deviner leurs codes.
+    const PAWAPAY_COUNTRIES = {
+        CI: { iso3: 'CIV', dial: '225' }, SN: { iso3: 'SEN', dial: '221' }, CM: { iso3: 'CMR', dial: '237' },
+        BJ: { iso3: 'BEN', dial: '229' }, TG: { iso3: 'TGO', dial: '228' }, ML: { iso3: 'MLI', dial: '223' },
+        BF: { iso3: 'BFA', dial: '226' }, GA: { iso3: 'GAB', dial: '241' }, CD: { iso3: 'COD', dial: '243' },
+    };
+    let pawapayConf = { at: 0, value: null };
+
+    async function pawapayActiveConf(baseUrl, token) {
+        if (pawapayConf.value && Date.now() - pawapayConf.at < 60 * 60 * 1000) return pawapayConf.value;
+        const { ok, data } = await fetchJson(`${baseUrl}/active-conf`, { headers: { Authorization: `Bearer ${token}` } });
+        if (!ok || !Array.isArray(data?.countries)) return pawapayConf.value; // garder l'ancienne si PawaPay ne répond pas
+        pawapayConf = { at: Date.now(), value: data };
+        return data;
+    }
+
+    async function resolvePawapayTarget(baseUrl, token, payment) {
+        const requested = String(payment.network || 'ORANGE_CI').toUpperCase();
+        const [operator, countryCode = 'CI'] = requested.split('_');
+        const country = PAWAPAY_COUNTRIES[countryCode] || PAWAPAY_COUNTRIES.CI;
+
+        let digits = String(payment.phone || '').replace(/\D/g, '');
+        if (!digits.startsWith(country.dial)) digits = country.dial + digits; // CI : 225 + 10 chiffres (0 inclus)
+
+        let correspondent = requested;
+        try {
+            const conf = await pawapayActiveConf(baseUrl, token);
+            const list = (conf?.countries || []).find(c => c.country === country.iso3)?.correspondents || [];
+            const canDeposit = c => !c.operationTypes || c.operationTypes.some(o => o.operationType === 'DEPOSIT');
+            const exact = list.find(c => c.correspondent === requested);
+            const byOperator = list.find(c => c.correspondent.startsWith(`${operator}_`) && canDeposit(c));
+            if (exact || byOperator) correspondent = (exact || byOperator).correspondent;
+            else if (list.length) throw new Error(`Ce moyen de paiement n'est pas disponible pour le moment. Choisissez-en un autre.`);
+        } catch (err) {
+            if (err.message.startsWith('Ce moyen')) throw err;
+            console.error('[PawaPay] Configuration active illisible :', err.message);
+        }
+        return { correspondent, msisdn: digits };
+    }
+
     async function getOrder(orderId) {
         const { data, error } = await supabase.from('orders').select('*').eq('id', orderId).maybeSingle();
         if (error) throw error;
@@ -180,6 +225,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
             const config = await getSetting('pawapay_config');
             if (!config?.jwtToken) throw new Error('Configuration PawaPay manquante.');
             const baseUrl = config.baseUrl || 'https://api.pawapay.cloud';
+            const { correspondent, msisdn } = await resolvePawapayTarget(baseUrl, config.jwtToken, payment);
             // depositId = id de la commande (UUID exigé par PawaPay) → idempotence naturelle.
             const { ok, data } = await fetchJson(`${baseUrl}/deposits`, {
                 method: 'POST',
@@ -188,8 +234,8 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
                     depositId: order.id,
                     amount: String(Math.round(Number(order.amount_due))),
                     currency: order.currency,
-                    correspondent: payment.network || 'ORANGE_CI',
-                    payer: { type: 'MSISDN', address: { value: payment.phone } },
+                    correspondent,
+                    payer: { type: 'MSISDN', address: { value: msisdn } },
                     statementDescription: 'Babipass Ticket',
                 }),
             });
