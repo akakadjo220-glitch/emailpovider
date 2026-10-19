@@ -724,7 +724,9 @@ async function sendOtp({ purpose, code, email, phone, context = {} }) {
             });
         })());
     }
-    if (phone) {
+    // Inscription, mot de passe oublié, ambassadeurs : e-mail uniquement (gratuit).
+    // WhatsApp ne sert plus qu'à la récupération de billets des acheteurs.
+    if (phone && purpose === 'tickets') {
         tasks.push(supabase.from('whatsapp_queue').insert([{ phone, message: OTP_WA_MESSAGE[purpose](code, context) }])
             .then(({ error }) => { if (error) throw error; }));
     }
@@ -734,7 +736,7 @@ async function sendOtp({ purpose, code, email, phone, context = {} }) {
 }
 
 /**
- * POST /api/auth/otp/request  { email, purpose: 'signup'|'reset', phone?, name? }
+ * POST /api/auth/otp/request  { email, purpose: 'signup'|'reset' } — code envoyé par e-mail uniquement.
  * Pour « reset », le code n'est envoyé qu'aux coordonnées enregistrées du compte
  * (jamais à un numéro fourni par le demandeur) et la réponse est toujours
  * identique, pour ne pas révéler l'existence d'un compte.
@@ -755,17 +757,16 @@ app.post('/api/auth/otp/request', async (req, res) => {
                 .maybeSingle();
             if (profile) {
                 const code = await createOtp(identifier, purpose);
-                await sendOtp({ purpose, code, email: identifier, phone: profile.phone || null });
+                await sendOtp({ purpose, code, email: identifier });
             }
             return res.status(200).json({ success: true });
         }
 
-        const phone = req.body.phone ? String(req.body.phone).replace(/\s/g, '') : null;
-        if (!isDeliverableEmail(identifier) && !phone) {
-            return res.status(400).json({ success: false, error: 'Email ou numéro requis.' });
+        if (!isDeliverableEmail(identifier)) {
+            return res.status(400).json({ success: false, error: 'Adresse e-mail valide requise.' });
         }
         const code = await createOtp(identifier, purpose);
-        const sent = await sendOtp({ purpose, code, email: identifier, phone });
+        const sent = await sendOtp({ purpose, code, email: identifier });
         if (!sent) return res.status(502).json({ success: false, error: "Impossible d'envoyer le code. Réessayez." });
         return res.status(200).json({ success: true });
     } catch (err) {
