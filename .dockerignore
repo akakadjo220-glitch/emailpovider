@@ -1,0 +1,12 @@
+# Jamais dans l'image : secrets, fichiers de test/débogage, historique git
+.env
+.env.*
+!.env.example
+node_modules
+.git
+test_*
+*.bak*
+*.sql
+*.cjs
+trigger_webhook.js
+test_out.txt
