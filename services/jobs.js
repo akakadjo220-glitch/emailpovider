@@ -13,7 +13,7 @@
 // une clé de déduplication : un destinataire ne reçoit jamais deux fois le même.
 // ═══════════════════════════════════════════════════════════════════════════
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
+const { createMailer } = require('./mailer');
 const { createHealthAlerts } = require('./alerts');
 
 const MAX_ATTEMPTS = 5;
@@ -42,7 +42,7 @@ async function mapWithConcurrency(items, limit, fn) {
     await Promise.all(runners);
 }
 
-function createWorker({ supabase, getSetting, getSmtpConfig, dispatchWhatsApp, checkout }) {
+function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
     const workerId = `${process.env.HOSTNAME || 'worker'}:${process.pid}:${crypto.randomBytes(3).toString('hex')}`;
     let running = false;
     const loops = [];
@@ -57,40 +57,20 @@ function createWorker({ supabase, getSetting, getSmtpConfig, dispatchWhatsApp, c
         });
     }
 
-    // ─── Transport SMTP mutualisé (connexions réutilisées) ───────────────
-    let transport = null;
-    let transportKey = null;
-
-    async function getTransport() {
-        const smtpConfig = await getSmtpConfig();
-        const key = crypto.createHash('sha256').update(JSON.stringify(smtpConfig)).digest('hex');
-        if (!transport || key !== transportKey) {
-            if (transport) transport.close();
-            transport = nodemailer.createTransport({
-                pool: true,
-                maxConnections: EMAIL_CONCURRENCY,
-                maxMessages: 500,
-                rateDelta: 1000,
-                rateLimit: Number(process.env.SMTP_MAX_PER_SECOND || 10),
-                host: smtpConfig.host,
-                port: smtpConfig.port || 465,
-                secure: smtpConfig.port == 465,
-                auth: { user: smtpConfig.user, pass: smtpConfig.pass },
-                tls: { rejectUnauthorized: process.env.SMTP_STRICT_TLS === 'true' },
-            });
-            transportKey = key;
-        }
-        return { transport, smtpConfig };
-    }
+    // ─── Envoi e-mail : connexions SMTP réutilisées + bascule sur le secours ─
+    const mailer = createMailer({
+        getSetting,
+        pool: {
+            pool: true,
+            maxConnections: EMAIL_CONCURRENCY,
+            maxMessages: 500,
+            rateDelta: 1000,
+            rateLimit: Number(process.env.SMTP_MAX_PER_SECOND || 10),
+        },
+    });
 
     async function sendEmail(job) {
-        const { transport: tx, smtpConfig } = await getTransport();
-        await tx.sendMail({
-            from: `"${smtpConfig.senderName || 'Babipass'}" <${smtpConfig.user}>`,
-            to: job.to_email,
-            subject: job.subject,
-            html: job.html_body,
-        });
+        await mailer.send({ to: job.to_email, subject: job.subject, html: job.html_body });
     }
 
     // ─── Files d'attente ─────────────────────────────────────────────────

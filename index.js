@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const nodemailer = require('nodemailer');
+const { createMailer } = require('./services/mailer');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const crypto = require('crypto');
@@ -364,25 +364,8 @@ app.post('/api/send-email', async (req, res) => {
     }
 });
 
-async function getSmtpConfig() {
-    const smtpConfig = await getSetting('smtp_config');
-    if (!smtpConfig || !smtpConfig.host || !smtpConfig.user || !smtpConfig.pass) {
-        throw new Error('Configuration SMTP non configurée.');
-    }
-    return smtpConfig;
-}
-
-function createSmtpTransport(smtpConfig) {
-    return nodemailer.createTransport({
-        host: smtpConfig.host,
-        port: smtpConfig.port || 465,
-        secure: smtpConfig.port == 465,
-        auth: { user: smtpConfig.user, pass: smtpConfig.pass },
-        // Comportement historique conservé (certificat non vérifié) ; SMTP_STRICT_TLS=true
-        // active la vérification une fois le certificat du serveur SMTP confirmé valide.
-        tls: { rejectUnauthorized: process.env.SMTP_STRICT_TLS === 'true' }
-    });
-}
+// SMTP principal (ex. Amazon SES) + bascule automatique sur le SMTP de secours.
+const mailer = createMailer({ getSetting });
 
 /**
  * Met un email en file d'attente (le worker l'envoie avec la config SMTP serveur).
@@ -396,11 +379,7 @@ async function enqueueEmail(to, subject, htmlBody) {
     if (!insertError) return { queued: true };
 
     console.warn('[EmailQueue] Insert failed, falling back to direct send:', insertError.message);
-    const smtpConfig = await getSmtpConfig();
-    const info = await createSmtpTransport(smtpConfig).sendMail({
-        from: `"${smtpConfig.senderName || 'Babipass'}" <${smtpConfig.user}>`,
-        to, subject, html: htmlBody,
-    });
+    const info = await mailer.send({ to, subject, html: htmlBody });
     return { queued: false, messageId: info.messageId };
 }
 
@@ -714,15 +693,12 @@ async function sendOtp({ purpose, code, email, phone, context = {} }) {
     const tasks = [];
     if (email && isDeliverableEmail(email)) {
         const content = OTP_EMAIL_CONTENT[purpose];
-        tasks.push((async () => {
-            const smtpConfig = await getSmtpConfig();
-            await createSmtpTransport(smtpConfig).sendMail({
-                from: `"Babipass" <${smtpConfig.user}>`,
-                to: email,
-                subject: `🔐 Votre code Babipass : ${code}`,
-                html: renderOtpEmail({ ...content, intro: content.intro({ ...context, email }), code }),
-            });
-        })());
+        tasks.push(mailer.send({
+            to: email,
+            senderName: 'Babipass',
+            subject: `🔐 Votre code Babipass : ${code}`,
+            html: renderOtpEmail({ ...content, intro: content.intro({ ...context, email }), code }),
+        }));
     }
     // Inscription, mot de passe oublié, ambassadeurs : e-mail uniquement (gratuit).
     // WhatsApp ne sert plus qu'à la récupération de billets des acheteurs.
@@ -1239,7 +1215,7 @@ if (PROCESS_ROLE === 'api' || PROCESS_ROLE === 'all') {
 }
 
 if (PROCESS_ROLE === 'worker' || PROCESS_ROLE === 'all') {
-    worker = createWorker({ supabase, getSetting, getSmtpConfig, dispatchWhatsApp, checkout });
+    worker = createWorker({ supabase, getSetting, dispatchWhatsApp, checkout });
     setTimeout(() => worker.start(), 3000);
 }
 
