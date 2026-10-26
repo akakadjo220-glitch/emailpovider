@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { createMailer } = require('./services/mailer');
+const { recordOtpFailure } = require('./services/alerts');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const crypto = require('crypto');
@@ -586,7 +587,7 @@ async function createOtp(identifier, purpose) {
         otp_code: hashOtp(purpose, identifier, code),
         expires_at: new Date(Date.now() + OTP_TTL_MS).toISOString(),
     }]);
-    if (error) throw error;
+    if (error) { recordOtpFailure(); throw error; }
     return code;
 }
 
@@ -708,7 +709,9 @@ async function sendOtp({ purpose, code, email, phone, context = {} }) {
     }
     const results = await Promise.allSettled(tasks);
     results.filter(r => r.status === 'rejected').forEach(r => console.error(`[OTP ${purpose}] Envoi échoué:`, r.reason?.message || r.reason));
-    return results.some(r => r.status === 'fulfilled');
+    const sent = results.some(r => r.status === 'fulfilled');
+    if (!sent) recordOtpFailure();
+    return sent;
 }
 
 /**

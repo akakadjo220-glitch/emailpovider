@@ -38,6 +38,11 @@ const RULES = [
         message: s => `Les e-mails ne partent plus : ${s.email_overdue} en retard, ${s.email_failed_last_hour} en échec sur la dernière heure. Vérifier le SMTP dans l'admin.`,
     },
     {
+        key: 'otp-down',
+        test: s => s.otp_failed_last_hour >= 3,
+        message: s => `${s.otp_failed_last_hour} codes de vérification n'ont pas pu être créés ou envoyés dans la dernière heure : inscriptions, mots de passe oubliés et récupérations de billets sont bloqués. Voir les journaux de l'API.`,
+    },
+    {
         key: 'whatsapp-down',
         test: s => s.whatsapp_overdue >= 20 || s.whatsapp_failed_last_hour >= 20,
         message: s => `Les messages WhatsApp ne partent plus : ${s.whatsapp_overdue} en retard, ${s.whatsapp_failed_last_hour} en échec sur la dernière heure.`,
@@ -45,6 +50,17 @@ const RULES = [
 ];
 
 const list = value => String(value || '').split(',').map(v => v.trim()).filter(Boolean);
+
+// Échecs de code OTP : comptés en mémoire, car un code qui n'a pas pu être enregistré
+// ne laisse aucune trace en base.
+// shortcut: compteur par processus ; à déplacer en base si l'API tourne sur plusieurs instances.
+const otpFailures = [];
+const recordOtpFailure = () => { otpFailures.push(Date.now()); };
+function otpFailedLastHour() {
+    const since = Date.now() - 60 * 60 * 1000;
+    while (otpFailures.length && otpFailures[0] < since) otpFailures.shift();
+    return otpFailures.length;
+}
 
 function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -61,6 +77,7 @@ function createHealthAlerts({ supabase, env = process.env, now = () => new Date(
             return [];
         }
         const s = Object.fromEntries(Object.entries(snapshot || {}).map(([k, v]) => [k, Number(v) || 0]));
+        s.otp_failed_last_hour = otpFailedLastHour();
         const fired = RULES.filter(rule => rule.test(s));
         if (!fired.length) return [];
 
@@ -104,4 +121,4 @@ function createHealthAlerts({ supabase, env = process.env, now = () => new Date(
     };
 }
 
-module.exports = { createHealthAlerts, RULES };
+module.exports = { createHealthAlerts, RULES, recordOtpFailure };
