@@ -14,7 +14,11 @@ const crypto = require('crypto');
 // Faux opérateur pour les tests de charge : paiement « confirmé » sans argent.
 // N'activer QUE sur un environnement de test (ALLOW_TEST_PAYMENTS=true).
 const TEST_PAYMENTS_ENABLED = process.env.ALLOW_TEST_PAYMENTS === 'true';
-const PROVIDERS = ['paystack', 'pawapay', 'feexpay', 'intouch', 'paydunya', ...(TEST_PAYMENTS_ENABLED ? ['loadtest'] : [])];
+const PROVIDERS = ['jeko', 'paystack', 'pawapay', 'feexpay', 'intouch', 'paydunya', ...(TEST_PAYMENTS_ENABLED ? ['loadtest'] : [])];
+// Jeko : pas de bac à sable, chaque appel déplace de l'argent réel.
+const JEKO_API = 'https://api.jeko.africa/partner_api';
+const JEKO_METHODS = ['wave', 'orange', 'mtn', 'moov', 'djamo', 'jeko'];
+const SITE_URL = (process.env.SITE_URL || 'https://babipass.com').replace(/\/$/, '');
 const VERIFY_MIN_INTERVAL_MS = 4000;
 const ORDER_TTL_MINUTES = 15;
 
@@ -92,6 +96,8 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
 
     function cleanPaymentInput(provider, payment = {}) {
         const phone = String(payment.phone || '').replace(/[^\d+]/g, '');
+        // Jeko : le client paie sur la page Jeko, seul le moyen choisi compte.
+        if (provider === 'jeko') return JEKO_METHODS.includes(payment.network) ? { phone, network: payment.network } : null;
         // Paystack (popup) et le faux opérateur de test n'ont pas besoin de numéro Mobile Money.
         if (provider !== 'paystack' && provider !== 'loadtest' && !/^\+?\d{8,15}$/.test(phone)) return null;
         return {
@@ -173,6 +179,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
     // ET que ses clés sont saisies : jamais de bouton qui mène à une erreur.
     // La vérification des paiements déjà lancés n'en dépend pas.
     const PROVIDER_READY = {
+        jeko: c => !!(c?.apiKey && c?.apiKeyId && c?.storeId),
         paystack: c => !!(c?.publicKey && c?.secretKey),
         pawapay: c => !!c?.jwtToken,
         feexpay: c => !!(c?.shopId && c?.token),
@@ -238,9 +245,36 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
         return data;
     }
 
+    const jekoHeaders = config => ({ 'X-API-KEY': config.apiKey, 'X-API-KEY-ID': config.apiKeyId });
+
     // ─── Initiation du paiement, par opérateur ───────────────────────────
     // Retourne { providerRef, client } ; client = données utiles au navigateur.
     const initiate = {
+        // Paiement sur la page Jeko (Wave, Orange, MTN, Moov, Djamo) ; le navigateur l'ouvre dans un onglet.
+        async jeko(order, payment) {
+            const config = await getSetting('jeko_config');
+            if (!config?.apiKey || !config?.apiKeyId || !config?.storeId) throw new Error('Configuration Jeko manquante.');
+            const back = ok => `${SITE_URL}/paiement-termine?ok=${ok}`;
+            const { ok, data } = await fetchJson(`${JEKO_API}/payment_requests`, {
+                method: 'POST',
+                headers: { ...jekoHeaders(config), 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    storeId: config.storeId,
+                    // En centimes, multiple de 100 (le franc CFA n'a pas de subdivision) ; arrondi au-dessus
+                    // pour ne jamais payer moins que le dû (finalize_order le refuserait).
+                    amountCents: Math.ceil(Number(order.amount_due)) * 100,
+                    currency: 'XOF',
+                    reference: order.id,
+                    paymentDetails: { type: 'redirect', data: { paymentMethod: payment.network, successUrl: back(1), errorUrl: back(0) } },
+                }),
+            });
+            if (!ok || !data?.id || !data?.redirectUrl) {
+                console.error('[Jeko] Demande de paiement refusée :', data);
+                throw new Error("Le paiement n'a pas pu démarrer. Réessayez ou choisissez un autre moyen.");
+            }
+            return { providerRef: data.id, client: { redirectUrl: data.redirectUrl, message: 'Finalisez le paiement sur la page Jeko.' } };
+        },
+
         async paystack(order) {
             const config = await getSetting('paystack_config');
             if (!config?.publicKey || !config?.secretKey) throw new Error('Configuration Paystack manquante.');
@@ -381,6 +415,25 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
     // ─── Vérification du paiement, par opérateur ─────────────────────────
     // Retourne { state: 'paid'|'failed'|'pending', amount?, currency? }.
     const verify = {
+        async jeko(order) {
+            const config = await getSetting('jeko_config');
+            if (!config?.apiKey || !order.provider_ref) return { state: 'pending' };
+            const { ok, data } = await fetchJson(`${JEKO_API}/payment_requests/${encodeURIComponent(order.provider_ref)}`, {
+                headers: jekoHeaders(config),
+            });
+            if (!ok || !data) return { state: 'pending' };
+            if (data.status === 'success') {
+                const amount = data.transaction?.amount; // { amount, currency }, en centimes comme amountCents
+                const cents = Number(typeof amount === 'object' ? amount?.amount : amount);
+                if (!Number.isFinite(cents)) return { state: 'pending' };
+                return { state: 'paid', amount: cents / 100, currency: order.currency };
+            }
+            // « error » après simple expiration n'est pas définitif : une validation déjà lancée
+            // chez l'opérateur peut encore aboutir. La commande expire alors chez nous et reste revérifiée.
+            if (data.status === 'error' && !/expired/i.test(String(data.errorReason || ''))) return { state: 'failed' };
+            return { state: 'pending' };
+        },
+
         async loadtest(order) {
             if (!TEST_PAYMENTS_ENABLED) return { state: 'pending' };
             return { state: 'paid', amount: Number(order.amount_due), currency: order.currency };
@@ -898,6 +951,35 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
             return res.status(200).end();
         } catch (err) {
             console.error('[Checkout] Webhook Paystack échoué:', err);
+            return res.status(500).end();
+        }
+    });
+
+    /**
+     * POST /api/webhooks/jeko — signature Jeko-Signature (HMAC-SHA256 du corps brut, hex).
+     * Jeko n'envoie rien pour un échec : la réconciliation et le suivi du navigateur s'en chargent.
+     */
+    app.post('/api/webhooks/jeko', async (req, res) => {
+        try {
+            const config = await getSetting('jeko_config');
+            const signature = req.headers['jeko-signature'];
+            if (!config?.webhookSecret || !req.rawBody || !signature) return res.status(401).end();
+            const expected = crypto.createHmac('sha256', config.webhookSecret).update(req.rawBody).digest('hex');
+            if (!safeEqual(String(signature).toLowerCase(), expected)) return res.status(401).end();
+
+            if (req.headers['jeko-event'] === 'TRANSACTION_COMPLETED') {
+                const details = req.body?.transactionDetails || {};
+                let order = isUuid(details.reference) ? await getOrder(details.reference) : null;
+                if (!order && details.id) {
+                    const { data } = await supabase.from('orders').select('*').eq('provider_ref', String(details.id)).maybeSingle();
+                    order = data;
+                }
+                // Le webhook ne fait que déclencher la vérification auprès de l'API Jeko.
+                if (order && order.provider === 'jeko') await processOrder(order, { source: 'webhook:jeko', force: true });
+            }
+            return res.status(200).end();
+        } catch (err) {
+            console.error('[Checkout] Webhook Jeko échoué:', err);
             return res.status(500).end();
         }
     });
