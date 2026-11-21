@@ -88,17 +88,6 @@ const authLimiter = sharedRateLimit({
     legacyHeaders: false,
 });
 
-// Envoi d'e-mails / WhatsApp : endpoints publics, fortement limités pour
-// empêcher leur usage comme relais de spam.
-const messagingLimiter = sharedRateLimit({
-    prefix: 'messaging',
-    windowMs: 15 * 60 * 1000,
-    max: 20,
-    message: { success: false, error: "Trop d'envois. Veuillez réessayer plus tard." },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-
 // Middleware
 // Derrière le reverse proxy (Coolify/Traefik), l'IP client est dans X-Forwarded-For.
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 1));
@@ -125,7 +114,6 @@ app.use('/api/', (req, res, next) => (
     req.method === 'GET' && req.path.startsWith('/public/') ? next() : globalLimiter(req, res, next)
 ));
 app.use('/api/auth/', authLimiter);
-app.use(['/api/send-email', '/api/send-whatsapp'], messagingLimiter);
 
 // ─── Health ────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
@@ -225,8 +213,18 @@ app.get(['/sitemap.xml', '/api/sitemap.xml'], async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 const WhatsAppAIBot = require('./services/WhatsAppAIBot');
 
+// Le fournisseur WhatsApp appelle /api/whatsapp/webhook?t=<WA_WEBHOOK_SECRET> ; sans ce secret,
+// n'importe qui ferait écrire le robot (et payer l'IA) vers le numéro de son choix.
+const WA_WEBHOOK_SECRET = process.env.WA_WEBHOOK_SECRET || '';
+if (!WA_WEBHOOK_SECRET) console.warn('⚠️  WA_WEBHOOK_SECRET non défini : le robot WhatsApp ignore les messages entrants.');
+
 app.post('/api/whatsapp/webhook', async (req, res) => {
     try {
+        const t = Buffer.from(String(req.query.t || ''));
+        const secret = Buffer.from(WA_WEBHOOK_SECRET);
+        if (!WA_WEBHOOK_SECRET || t.length !== secret.length || !crypto.timingSafeEqual(t, secret)) {
+            return res.status(401).end();
+        }
         if (!req.body) return res.status(200).send('OK');
 
         // Evolution API / WaSender payload mapping (heuristic)
@@ -338,32 +336,8 @@ app.post('/api/upload', upload.single('source'), async (req, res) => {
 //  3. A background worker picks it up and sends it gracefully
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * POST /api/send-email
- * Pushes the email to the queue and returns immediately (non-blocking).
- */
-app.post('/api/send-email', async (req, res) => {
-    try {
-        // La configuration SMTP vient uniquement du serveur : un smtpConfig envoyé
-        // par le client est ignoré.
-        const { to, subject, htmlBody } = req.body;
-
-        if (!to || !subject || !htmlBody) {
-            return res.status(400).json({ error: 'Paramètres email manquants (to, subject, htmlBody)' });
-        }
-        if (typeof to !== 'string' || !/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(to)) {
-            return res.status(400).json({ error: 'Adresse email invalide' });
-        }
-
-        await enqueueEmail(to, subject, htmlBody);
-        console.log(`[EmailQueue] ✅ Email mis en file d'attente → ${to}`);
-        return res.status(202).json({ success: true, queued: true });
-
-    } catch (error) {
-        console.error('[EmailQueue] Erreur enqueue:', error);
-        return res.status(500).json({ success: false, error: "Impossible d'envoyer l'email." });
-    }
-});
+// Pas de route publique d'envoi : e-mails et WhatsApp ne partent que du serveur
+// (billets, codes, transferts), jamais avec un contenu fourni par le navigateur.
 
 // SMTP principal (ex. Amazon SES) + bascule automatique sur le SMTP de secours.
 const mailer = createMailer({ getSetting });
@@ -383,38 +357,6 @@ async function enqueueEmail(to, subject, htmlBody) {
     const info = await mailer.send({ to, subject, html: htmlBody });
     return { queued: false, messageId: info.messageId };
 }
-
-app.post('/api/send-whatsapp', async (req, res) => {
-    try {
-        const { phone, message, mediaUrl } = req.body;
-
-        if (!phone || !message) {
-            return res.status(400).json({ error: 'Paramètres WhatsApp manquants (phone, message)' });
-        }
-        if (!/^\+?\d{8,15}$/.test(String(phone).replace(/\s/g, '')) || String(message).length > 2000) {
-            return res.status(400).json({ error: 'Paramètres WhatsApp invalides' });
-        }
-
-        // Insert into queue
-        const { data: inserted, error: insertError } = await supabase
-            .from('whatsapp_queue')
-            .insert([{ phone, message, media_url: mediaUrl }])
-            .select('id')
-            .single();
-
-        if (insertError) {
-            console.error('[WhatsAppQueue] DB insert failed:', insertError.message);
-            return res.status(500).json({ success: false, error: insertError.message });
-        }
-
-        console.log(`[WhatsAppQueue] ✅ Message mis en file d'attente (id: ${inserted?.id}) → ${phone}`);
-        return res.status(202).json({ success: true, queued: true, id: inserted?.id });
-
-    } catch (error) {
-        console.error('[WhatsAppQueue] Erreur enqueue:', error);
-        return res.status(500).json({ success: false, error: error.message });
-    }
-});
 
 /**
  * GET /api/email-queue/stats — état des files (admin connecté uniquement).
