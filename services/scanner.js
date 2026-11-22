@@ -182,7 +182,7 @@ function registerScannerRoutes(app, { supabase, enqueueEmail, rateLimit }) {
             const newId = data.new_ticket_id;
             const { data: event } = await supabase.from('events').select('title').eq('id', data.event_id).maybeSingle();
             const eventTitle = event?.title || 'votre événement';
-            const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(newId)}`;
+            const qrUrl = `${(process.env.PUBLIC_API_URL || '').replace(/\/$/, '')}/api/public/qr?s=300&d=${encodeURIComponent(newId)}`;
             const message = `🎟️ *NOUVEAU BILLET* 🎟️\n\nBonjour ${name} !\nUn billet vous a été transféré pour *${eventTitle}*.\nRéférence : ${newId}\n\nPrésentez ce QR Code à l'entrée.`;
 
             try {

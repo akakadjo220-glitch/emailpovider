@@ -113,7 +113,7 @@ app.use(express.json({
 app.use('/api/', (req, res, next) => (
     req.method === 'GET' && req.path.startsWith('/public/') ? next() : globalLimiter(req, res, next)
 ));
-app.use('/api/auth/', authLimiter);
+app.use(['/api/auth/', '/api/tickets/recover/'], authLimiter);
 
 // ─── Health ────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
@@ -263,11 +263,34 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
+// ─── QR code des billets (e-mails, WhatsApp) ───────────────────────────────
+// Généré ici : avant, chaque code de billet (qui suffit à entrer ou à transférer le billet)
+// partait chez un site tiers. Sous /api/public/ : pas de limite par IP, car les proxys
+// d'images (Gmail…) chargent les QR de milliers d'e-mails depuis quelques IP.
+const QRCode = require('qrcode');
+app.get('/api/public/qr', async (req, res) => {
+    const data = String(req.query.d || '');
+    if (!/^[A-Za-z0-9._~-]{1,300}$/.test(data)) return res.status(400).end();
+    const width = Math.min(Math.max(Number(req.query.s) || 300, 100), 600);
+    try {
+        const png = await QRCode.toBuffer(data, { width, margin: 1 });
+        res.set({ 'Cache-Control': 'public, max-age=31536000, immutable', 'Cross-Origin-Resource-Policy': 'cross-origin' });
+        return res.type('png').send(png);
+    } catch (err) {
+        console.error('[QR] Génération échouée:', err.message);
+        return res.status(500).end();
+    }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ─── CHEVERETO MEDIA UPLOAD & VERIFICATION PROXY ──────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
 app.post('/api/upload', upload.single('source'), async (req, res) => {
     try {
+        // Réservé aux comptes connectés : sinon n'importe qui hébergerait ses fichiers chez nous.
+        if (!(await getAuthenticatedUser(req))) {
+            return res.status(401).json({ error: 'Connectez-vous pour envoyer un fichier.' });
+        }
         if (!req.file) {
             return res.status(400).json({ error: 'Aucun fichier fourni (formats acceptés : JPG, PNG, WEBP, GIF, PDF ; 10 Mo max)' });
         }
@@ -498,6 +521,7 @@ async function dispatchWhatsApp(job) {
 // code d'inscription ne peut pas servir à réinitialiser un mot de passe.
 const OTP_TTL_MS = 10 * 60 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
+const OTP_ATTEMPTS_WINDOW_MS = 60 * 60 * 1000;
 const OTP_PEPPER = process.env.OTP_PEPPER || SUPABASE_SERVICE_ROLE_KEY;
 const OTP_PURPOSES = ['signup', 'reset', 'ambassador', 'tickets'];
 
@@ -523,11 +547,18 @@ function isDeliverableEmail(value) {
 
 async function createOtp(identifier, purpose) {
     const code = crypto.randomInt(100000, 1000000).toString();
+    // Les erreurs du code précédent sont conservées pendant 1 h : redemander un code ne redonne
+    // pas 5 essais neufs (sinon force brute : 5 essais par demande, sans fin).
+    const { data: previous } = await supabase.from('auth_otps').select('attempts, created_at').eq('email', identifier).maybeSingle();
+    const recent = previous && Date.now() - new Date(previous.created_at).getTime() < OTP_ATTEMPTS_WINDOW_MS;
     await supabase.from('auth_otps').delete().eq('email', identifier);
     const { error } = await supabase.from('auth_otps').insert([{
         email: identifier,
         otp_code: hashOtp(purpose, identifier, code),
         expires_at: new Date(Date.now() + OTP_TTL_MS).toISOString(),
+        attempts: recent ? Number(previous.attempts || 0) : 0,
+        // Garde la date du premier code de la fenêtre, pour que la fenêtre ne glisse pas à chaque demande.
+        ...(recent ? { created_at: previous.created_at } : {}),
     }]);
     if (error) { recordOtpFailure(); throw error; }
     return code;
@@ -718,23 +749,14 @@ app.post('/api/auth/otp/verify', async (req, res) => {
 });
 
 // ─── Recherche de compte (la table profiles n'est plus lisible publiquement) ──
-// Comptes « mode téléphone » : e-mail technique <numéro>@organizer.babipass.local,
-// ou numéro dans le nom. Seuls des chiffres entrent dans le filtre PostgREST.
-function phoneCandidates(rawInput, fullPhone) {
-    const digits = v => String(v || '').replace(/\D/g, '');
-    const raw = digits(rawInput);
-    const full = digits(fullPhone);
-    return {
-        email: [...new Set([full, raw, raw.replace(/^0+/, '')])].filter(d => d.length >= 6),
-        name: [...new Set([full, raw])].filter(d => d.length >= 6),
-    };
-}
-
-async function findProfilesByPhone(rawInput, fullPhone, columns, limit) {
-    const c = phoneCandidates(rawInput, fullPhone);
-    if (c.email.length === 0) return [];
-    const filters = [...c.email.map(d => `email.like.%${d}%`), ...c.name.map(d => `name.like.%${d}%`)];
-    const { data, error } = await supabase.from('profiles').select(columns).or(filters.join(',')).limit(limit);
+// Comptes « mode téléphone » : e-mail technique +<indicatif><numéro>@organizer.babipass.local (OrganizerLogin).
+// Égalité exacte sur le numéro complet : une recherche partielle (LIKE) renvoyait l'e-mail
+// de n'importe quel compte contenant 6 chiffres donnés.
+async function findProfilesByPhone(fullPhone, columns) {
+    const digits = String(fullPhone || '').replace(/\D/g, '');
+    if (digits.length < 8 || digits.length > 15) return [];
+    const { data, error } = await supabase.from('profiles').select(columns)
+        .eq('email', `+${digits}@organizer.babipass.local`).limit(1);
     if (error) throw error;
     return data || [];
 }
@@ -745,7 +767,7 @@ async function findProfilesByPhone(rawInput, fullPhone, columns, limit) {
  */
 app.post('/api/auth/resolve-phone', async (req, res) => {
     try {
-        const profiles = await findProfilesByPhone(req.body.phone, req.body.full_phone, 'email', 1);
+        const profiles = await findProfilesByPhone(req.body.full_phone, 'email');
         if (profiles.length === 0 || !profiles[0].email) {
             return res.status(404).json({ success: false, error: 'Aucun compte trouvé avec ce numéro de téléphone.' });
         }
@@ -764,7 +786,7 @@ app.post('/api/auth/account-exists', async (req, res) => {
     try {
         let exists;
         if (req.body.phone) {
-            exists = (await findProfilesByPhone(req.body.phone, req.body.full_phone, 'id', 1)).length > 0;
+            exists = (await findProfilesByPhone(req.body.full_phone, 'id')).length > 0;
         } else {
             const email = normalizeIdentifier(req.body.email);
             if (!email) return res.status(400).json({ success: false, error: 'Email ou numéro requis.' });
@@ -903,7 +925,7 @@ app.post('/api/auth/ambassador-otp', async (req, res) => {
 const { registerCheckoutRoutes } = require('./services/checkout');
 const { createAdmission } = require('./services/admission');
 const admission = createAdmission(supabase, metrics);
-const checkout = registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateLimit: sharedRateLimit, admission, metrics });
+const checkout = registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateLimit: sharedRateLimit, admission, metrics, getAuthenticatedUser });
 
 // Agents (connexion par jeton signé), scanner et transfert de billet.
 const { registerScannerRoutes } = require('./services/scanner');

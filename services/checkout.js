@@ -37,7 +37,7 @@ const CHECKOUT_ERRORS = {
     INVALID_CATEGORY: 'Catégorie de billet invalide.',
 };
 
-function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateLimit, admission, metrics }) {
+function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateLimit, admission, metrics, getAuthenticatedUser }) {
     if (TEST_PAYMENTS_ENABLED) {
         console.warn('🚨🚨 ALLOW_TEST_PAYMENTS=true : le faux opérateur « loadtest » émet des billets SANS paiement. Ne JAMAIS activer en production. 🚨🚨');
     }
@@ -83,15 +83,6 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
         if (!code) return null;
         const status = code === 'SOLD_OUT' || code === 'INSTALLMENT_PENDING' ? 409 : code === 'NOT_EVENT_ORGANIZER' ? 403 : 400;
         return { status, error: CHECKOUT_ERRORS[code], code };
-    }
-
-    /** Utilisateur Supabase authentifié (Authorization: Bearer <jwt>). */
-    async function getAuthenticatedUser(req) {
-        const header = req.headers.authorization || '';
-        const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-        if (!token) return null;
-        const { data, error } = await supabase.auth.getUser(token);
-        return error ? null : data.user;
     }
 
     function cleanPaymentInput(provider, payment = {}) {
@@ -521,7 +512,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
                     ? templates.find(t => t.id === 'ticket_purchase' && t.is_active !== false)
                     : null;
                 for (const ticket of tickets) {
-                    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(ticket.qr_code)}`;
+                    const qrUrl = `${PUBLIC_API_URL}/api/public/qr?s=300&d=${encodeURIComponent(ticket.qr_code)}`;
                     const vars = {
                         eventTitle: event.title,
                         ticketType: typeNames[ticket.ticket_type] || 'Standard',
@@ -545,7 +536,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
                 const rows = tickets.map(ticket => ({
                     phone: order.buyer_phone,
                     message: `🎉 Félicitations pour votre achat !\n\nVoici votre billet pour l'événement *${event.title}*.\nDate: ${eventDate}\nLieu: ${event.location || ''}, ${event.city || ''}\nRéférence: ${ticket.id}\n\nPrésentez ce QR Code à l'entrée. À très vite !`,
-                    media_url: `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(ticket.qr_code)}`,
+                    media_url: `${PUBLIC_API_URL}/api/public/qr?s=250&d=${encodeURIComponent(ticket.qr_code)}`,
                 }));
                 const { error } = await supabase.from('whatsapp_queue').insert(rows);
                 if (error) throw error;
