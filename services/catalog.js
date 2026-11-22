@@ -16,6 +16,8 @@ const LIST_TTL_MS = 30 * 1000;
 const EVENT_TTL_MS = 10 * 1000;
 const MAX_PAGE_SIZE = 50;
 const PUBLIC_STATUSES = ['published', 'completed'];
+// Tout l'événement sauf les taux négociés et le contexte IA de l'organisateur (même liste que le site, constants.ts).
+const PUBLIC_EVENT_COLUMNS = 'id, created_at, organizer_id, organizer_name, title, description, date, end_date, location, city, country, coordinates, price, currency, image, gallery, category, sold, capacity, program, status, video, practical_infos, support_phone, views, video_url, slug, cancellation_status, cancellation_reason, ambassador_enabled, ambassador_commission_type, ambassador_commission_value, sales_close_before_minutes, thanks_email_sent, average_rating, total_reviews, sport_type, home_team, away_team, competition, tournament_id, home_score, away_score, match_status, archived_at';
 
 function createMicroCache() {
     const entries = new Map();
@@ -72,7 +74,7 @@ function registerCatalogRoutes(app, { supabase }) {
             const body = await cache.get(key, LIST_TTL_MS, async () => {
                 let query = supabase
                     .from('events')
-                    .select('*, ticket_types(*)', { count: 'exact' })
+                    .select(`${PUBLIC_EVENT_COLUMNS}, ticket_types(*)`, { count: 'exact' })
                     .eq('status', 'published');
                 if (country !== 'Global') query = query.eq('country', country);
                 if (category !== 'Tous') query = query.eq('category', category);
@@ -148,7 +150,7 @@ function registerCatalogRoutes(app, { supabase }) {
             const event = await cache.get(`event:${slug}`, EVENT_TTL_MS, async () => {
                 const { data, error } = await supabase
                     .from('events')
-                    .select('*, ticket_types(*), profiles(name, company, avatar)')
+                    .select(`${PUBLIC_EVENT_COLUMNS}, ticket_types(*), profiles(name, company, avatar)`)
                     .eq(isUuid ? 'id' : 'slug', slug)
                     .in('status', PUBLIC_STATUSES)
                     .maybeSingle();

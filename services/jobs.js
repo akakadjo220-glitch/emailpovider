@@ -210,13 +210,13 @@ function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
     const isDisabled = value => value === false || value === 'false';
 
     async function runEventLifecycle() {
-        // 1. Événements terminés depuis 24 h → « completed »
+        // 1. Événements terminés depuis 24 h (date de fin si plusieurs jours) → « completed »
         const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
         const { data: closed, error: closeErr } = await supabase
             .from('events')
             .update({ status: 'completed' })
             .eq('status', 'published')
-            .lt('date', cutoff)
+            .or(`end_date.lt."${cutoff}",and(end_date.is.null,date.lt."${cutoff}")`)
             .select('id, title');
         if (closeErr) throw closeErr;
         if (closed?.length) console.log(`[Lifecycle] ${closed.length} événement(s) passé(s) en « completed »`);
@@ -317,7 +317,6 @@ function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
         running = false;
         wakeUps.forEach(wake => wake());
         await Promise.race([Promise.all(loops), sleep(25000)]);
-        if (transport) transport.close();
         console.log('[Worker] Arrêté proprement.');
     }
 
