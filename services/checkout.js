@@ -33,6 +33,10 @@ const CHECKOUT_ERRORS = {
     INVALID_AMOUNT: 'Montant invalide (minimum 100).',
     NOTHING_TO_PAY: 'Aucun paiement en attente pour ce billet.',
     INSTALLMENT_PENDING: 'Un paiement de tranche est déjà en cours pour ce billet. Patientez quelques minutes.',
+    INSTALLMENT_UNAVAILABLE: "Le paiement en plusieurs fois n'est pas proposé pour cet événement.",
+    INSTALLMENT_DEFAULTED: "Échéance dépassée : ce billet a été annulé. Les sommes versées vous ont été rendues en avoir (code envoyé par WhatsApp ou e-mail).",
+    CREDIT_INVALID: 'Code avoir inconnu ou déjà utilisé.',
+    CREDIT_FULL_ONLY: "L'avoir s'utilise pour un paiement en une fois.",
     NOT_EVENT_ORGANIZER: "Cet événement ne vous appartient pas.",
     INVALID_CATEGORY: 'Catégorie de billet invalide.',
 };
@@ -113,21 +117,36 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
         const { error: refError } = await supabase.from('orders').update({ provider_ref: initiated.providerRef }).eq('id', order.id);
         if (refError) throw refError;
 
-        return res.status(201).json({
-            success: true,
-            order: {
-                id: order.id,
-                token: order.public_token,
-                kind: order.kind || 'tickets',
-                amount_due: Number(order.amount_due),
-                total_amount: Number(order.total_amount),
-                currency: order.currency,
-                quantity: order.quantity,
-                expires_at: order.expires_at,
-                provider,
-            },
-            payment: initiated.client,
-        });
+        return res.status(201).json({ success: true, order: orderBody(order, provider), payment: initiated.client });
+    }
+
+    function orderBody(order, provider) {
+        return {
+            id: order.id,
+            token: order.public_token,
+            kind: order.kind || 'tickets',
+            amount_due: Number(order.amount_due),
+            total_amount: Number(order.total_amount),
+            currency: order.currency,
+            quantity: order.quantity,
+            expires_at: order.expires_at,
+            provider,
+            installment: order.meta?.installment || null,
+        };
+    }
+
+    /** Commande entièrement couverte par un avoir : billets émis sans passer par un opérateur. */
+    async function payWithCredit(res, order) {
+        if (Number(order.amount_due) !== 0) {
+            await supabase.rpc('release_order', { p_order_id: order.id, p_status: 'failed', p_reason: 'Avoir insuffisant' });
+            return res.status(400).json({ success: false, error: "L'avoir ne couvre pas tout : choisissez un moyen de paiement pour le reste.", code: 'CREDIT_INSUFFICIENT' });
+        }
+        const providerRef = `credit:${order.id}`;
+        const { error } = await supabase.from('orders').update({ provider_ref: providerRef }).eq('id', order.id);
+        if (error) throw error;
+        // En cas d'échec ici, la réconciliation la finalise (verify.credit).
+        await finalize({ ...order, provider_ref: providerRef }, { amount: 0, currency: order.currency }, 'credit');
+        return res.status(201).json({ success: true, order: orderBody(order, 'credit'), payment: { paid: true } });
     }
 
     async function fetchJson(url, options = {}) {
@@ -406,6 +425,10 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
     // ─── Vérification du paiement, par opérateur ─────────────────────────
     // Retourne { state: 'paid'|'failed'|'pending', amount?, currency? }.
     const verify = {
+        // Commande réglée entièrement par avoir : rien à encaisser (finalisée tout de suite, ou ici en secours).
+        async credit(order) {
+            return Number(order.amount_due) === 0 ? { state: 'paid', amount: 0, currency: order.currency } : { state: 'failed' };
+        },
         async jeko(order) {
             const config = await getSetting('jeko_config');
             if (!config?.apiKey || !order.provider_ref) return { state: 'pending' };
@@ -640,14 +663,31 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
         }
     });
 
+    /** GET /api/checkout/credits/:code — solde d'un avoir, pour l'afficher avant de payer. */
+    app.get('/api/checkout/credits/:code', checkoutLimiter, async (req, res) => {
+        try {
+            const code = String(req.params.code || '').trim().slice(0, 32);
+            const { data, error } = await supabase.rpc('credit_balance', { p_code: code });
+            if (error) throw error;
+            if (!data) return res.status(404).json({ success: false, error: CHECKOUT_ERRORS.CREDIT_INVALID, code: 'CREDIT_INVALID' });
+            return res.json({ success: true, remaining: Number(data) });
+        } catch (err) {
+            console.error('[Checkout] Lecture d\'avoir échouée:', err.message);
+            return res.status(500).json({ success: false, error: 'Avoir illisible pour le moment.' });
+        }
+    });
+
     app.post('/api/checkout/orders', checkoutLimiter, async (req, res) => {
         try {
-            const { event_id, items, payment_mode = 'full', provider, buyer = {}, buyer_location = null, referral_code = null, payment = {} } = req.body || {};
+            const { event_id, items, payment_mode = 'full', provider, buyer = {}, buyer_location = null, referral_code = null, payment = {}, credit_code = null } = req.body || {};
+            const creditCode = credit_code ? String(credit_code).trim().slice(0, 32) : null;
+            // « credit » : tout est réglé par l'avoir, aucun opérateur.
+            const creditOnly = provider === 'credit' && !!creditCode;
 
-            if (!isUuid(event_id) || !PROVIDERS.includes(provider) || !items || typeof items !== 'object') {
+            if (!isUuid(event_id) || !(PROVIDERS.includes(provider) || creditOnly) || !items || typeof items !== 'object') {
                 return res.status(400).json({ success: false, error: 'Commande invalide.' });
             }
-            if (await providerUnavailable(res, provider)) return;
+            if (!creditOnly && await providerUnavailable(res, provider)) return;
             const itemList = Object.entries(items)
                 .map(([id, qty]) => ({ id, qty: Number(qty) }))
                 .filter(i => i.qty > 0);
@@ -665,7 +705,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
                 return res.status(400).json({ success: false, error: 'Numéro WhatsApp invalide.' });
             }
 
-            const paymentInput = cleanPaymentInput(provider, payment);
+            const paymentInput = creditOnly ? {} : cleanPaymentInput(provider, payment);
             if (!paymentInput) {
                 return res.status(400).json({ success: false, error: 'Numéro Mobile Money invalide.' });
             }
@@ -681,6 +721,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
                     p_referral_code: referral_code ? String(referral_code).slice(0, 64) : null,
                     p_buyer_location: buyer_location && typeof buyer_location === 'object' ? buyer_location : null,
                     p_ttl_minutes: ORDER_TTL_MINUTES,
+                    p_credit_code: creditCode,
                 });
                 if (error) {
                     const mapped = mapSqlError(error);
@@ -690,6 +731,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
                 }
                 metrics?.inc('orders_created_total', { kind: 'tickets', provider });
 
+                if (creditOnly) return payWithCredit(res, order);
                 // Si l'opérateur refuse, startPayment libère immédiatement les places.
                 return startPayment(res, order, provider, paymentInput);
             };
@@ -871,7 +913,10 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
                 payment_mode: order.payment_mode,
                 expires_at: order.expires_at,
             };
-            if (order.status === 'paid' && kind === 'tickets') body.tickets = await loadTickets(order);
+            if (order.status === 'paid' && kind === 'tickets') {
+                body.tickets = await loadTickets(order);
+                body.installment = order.meta?.installment || null;
+            }
             if (order.status === 'paid' && kind === 'installment' && order.parent_order_id) {
                 // Billets de l'achat d'origine : « valid » dès que la totalité est réglée.
                 const parent = await getOrder(order.parent_order_id);

@@ -124,6 +124,7 @@ function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
         { name: 'rollup-counters', minIntervalS: 55, ttlS: 300, run: runCounterRollup },
         { name: 'event-lifecycle', minIntervalS: 3500, ttlS: 1800, run: runEventLifecycle },
         { name: 'event-reminders', minIntervalS: 3500, ttlS: 1800, run: runReminders },
+        { name: 'tontine-overdue', minIntervalS: 3500, ttlS: 600, run: runOverdueInstallments },
         { name: 'purge-operational-data', minIntervalS: 86000, ttlS: 600, run: runPurge },
         { name: 'ensure-archive-partitions', minIntervalS: 86000, ttlS: 300, run: runEnsurePartitions },
         // Alertes d'exploitation (paiements bloqués, e-mails en panne…) : voir services/alerts.js.
@@ -263,6 +264,33 @@ function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
             }));
             console.log(`[Reminders] ${queued} rappel(s) mis en file pour « ${event.title} » (doublons ignorés)`);
         }
+    }
+
+    /** Tontine : échéance dépassée → billet annulé, avoir créé en base ; ici on prévient l'acheteur. */
+    async function runOverdueInstallments() {
+        const { data: credits, error } = await supabase.rpc('cancel_overdue_installments');
+        if (error) throw error;
+        if (!credits?.length) return;
+        const eventIds = [...new Set(credits.map(c => c.event_id))];
+        const { data: events } = await supabase.from('events').select('id, title').in('id', eventIds);
+        const titles = Object.fromEntries((events || []).map(e => [e.id, e.title]));
+        const amount = n => `${Number(n).toLocaleString('fr-FR')} FCFA`;
+
+        for (const c of credits) {
+            const title = titles[c.event_id] || 'votre événement';
+            const text = `Votre échéance Tontine pour « ${title} » est dépassée : le billet a été annulé.\n\n`
+                + `Les ${amount(c.amount)} déjà versés ne sont pas perdus : ils deviennent un avoir à utiliser sur Babipass.\n`
+                + `Code avoir : ${c.code}\n\nSaisissez ce code au moment de payer votre prochain billet.`;
+            const row = c.contact_method === 'wa' && c.buyer_phone
+                ? { table: 'whatsapp_queue', data: { phone: c.buyer_phone, message: text } }
+                : c.buyer_email
+                    ? { table: 'email_queue', data: { to_email: c.buyer_email, subject: `Votre avoir Babipass : ${c.code}`, html_body: `<p>${escapeHtml(text).replace(/\n/g, '<br>')}</p>`, dedupe_key: `credit:${c.code}` } }
+                    : null;
+            if (!row) continue;
+            const { error: qErr } = await supabase.from(row.table).insert(row.data);
+            if (qErr) console.error(`[Tontine] Avertissement non envoyé pour l'avoir ${c.code} :`, qErr.message);
+        }
+        console.log(`[Tontine] ${credits.length} achat(s) annulé(s) après échéance, avoir(s) envoyé(s)`);
     }
 
     /** Reporte les compteurs de vues / clics répartis sur events.views et ambassador_links.clicks. */
