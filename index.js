@@ -854,30 +854,61 @@ function ticketRecoveryContact(body) {
     return { channel, contact };
 }
 
+// La réponse est toujours la même : elle ne dit pas si ce contact a des billets, ni combien.
 app.post('/api/tickets/recover/request', async (req, res) => {
     try {
         const { channel, contact } = ticketRecoveryContact(req.body);
         if (!contact) return res.status(400).json({ success: false, error: 'Contact requis.' });
 
-        const { data: tickets, error } = await supabase.rpc('find_tickets_by_contact', { p_contact: contact });
-        if (error) throw error;
-        const count = (tickets || []).length;
-        if (count === 0) return res.status(200).json({ success: true, count: 0 });
-
-        const code = await createOtp(contact, 'tickets');
-        await sendOtp({
-            purpose: 'tickets',
-            code,
-            email: channel === 'email' ? contact : null,
-            phone: channel === 'wa' ? contact : null,
-            context: { count },
-        });
-        return res.status(200).json({ success: true, count });
+        const { tickets, credits } = await walletContents(contact);
+        const count = tickets.filter(t => t.status !== 'cancelled').length;
+        if (count > 0 || credits.length > 0) {
+            const code = await createOtp(contact, 'tickets');
+            await sendOtp({
+                purpose: 'tickets',
+                code,
+                email: channel === 'email' ? contact : null,
+                phone: channel === 'wa' ? contact : null,
+                context: { count },
+            });
+        }
+        return res.status(200).json({ success: true });
     } catch (err) {
         console.error('[Ticket recovery request] Error:', err);
         return res.status(500).json({ success: false, error: 'Erreur système lors de la recherche.' });
     }
 });
+
+// ─── Mes billets reliés au contact : jeton signé de 30 jours, remis après le code ───
+const WALLET_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const WALLET_SECRET = process.env.WALLET_TOKEN_SECRET || SUPABASE_SERVICE_ROLE_KEY;
+const walletSign = payload => crypto.createHmac('sha256', WALLET_SECRET).update(`wallet:${payload}`).digest('base64url');
+
+function issueWalletToken(contact) {
+    const payload = Buffer.from(JSON.stringify({ c: contact, exp: Date.now() + WALLET_TTL_MS })).toString('base64url');
+    return `${payload}.${walletSign(payload)}`;
+}
+
+function readWalletToken(token) {
+    const [payload, sig] = String(token || '').split('.');
+    if (!payload || !sig) return null;
+    const expected = walletSign(payload);
+    if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+    try {
+        const { c, exp } = JSON.parse(Buffer.from(payload, 'base64url').toString());
+        return c && exp > Date.now() ? c : null;
+    } catch { return null; }
+}
+
+async function walletContents(contact) {
+    const [{ data: tickets, error: tErr }, { data: credits, error: cErr }] = await Promise.all([
+        supabase.rpc('find_tickets_by_contact', { p_contact: contact }),
+        supabase.rpc('credits_by_contact', { p_contact: contact }),
+    ]);
+    if (tErr) throw tErr;
+    if (cErr) throw cErr;
+    return { tickets: tickets || [], credits: credits || [] };
+}
 
 app.post('/api/tickets/recover/verify', async (req, res) => {
     try {
@@ -885,12 +916,23 @@ app.post('/api/tickets/recover/verify', async (req, res) => {
         const ok = await verifyOtp(contact, 'tickets', req.body.code, { consume: true });
         if (!ok) return res.status(400).json({ success: false, error: 'Code incorrect ou expiré.' });
 
-        const { data: tickets, error } = await supabase.rpc('find_tickets_by_contact', { p_contact: contact });
-        if (error) throw error;
-        return res.status(200).json({ success: true, tickets: tickets || [] });
+        return res.status(200).json({ success: true, ...(await walletContents(contact)), token: issueWalletToken(contact), contact });
     } catch (err) {
         console.error('[Ticket recovery verify] Error:', err);
         return res.status(500).json({ success: false, error: 'Erreur système lors de la récupération.' });
+    }
+});
+
+/** GET /api/tickets/mine (Authorization: Bearer <jeton>) — billets et avoirs à jour du contact vérifié. */
+app.get('/api/tickets/mine', async (req, res) => {
+    try {
+        const contact = readWalletToken(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
+        if (!contact) return res.status(401).json({ success: false, error: 'Session expirée : vérifiez à nouveau votre contact.' });
+        res.set('Cache-Control', 'no-store');
+        return res.status(200).json({ success: true, ...(await walletContents(contact)), contact });
+    } catch (err) {
+        console.error('[Tickets mine] Error:', err);
+        return res.status(500).json({ success: false, error: 'Billets indisponibles pour le moment.' });
     }
 });
 
