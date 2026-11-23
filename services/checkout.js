@@ -268,7 +268,8 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
         async jeko(order, payment) {
             const config = await getSetting('jeko_config');
             if (!config?.apiKey || !config?.apiKeyId || !config?.storeId) throw new Error('Configuration Jeko manquante.');
-            const back = ok => `${SITE_URL}/paiement-termine?ok=${ok}`;
+            // Retour dans le même onglet : la page lit le statut avec le jeton de la commande (lecture seule).
+            const back = ok => `${SITE_URL}/paiement-termine?order=${order.id}&t=${encodeURIComponent(order.public_token)}&ok=${ok}`;
             const { ok, data } = await fetchJson(`${JEKO_API}/payment_requests`, {
                 method: 'POST',
                 headers: { ...jekoHeaders(config), 'Content-Type': 'application/json' },
@@ -916,6 +917,10 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
                 amount_due: Number(order.amount_due),
                 payment_mode: order.payment_mode,
                 expires_at: order.expires_at,
+                // Pour la page de retour du paiement (/paiement-termine).
+                event_id: order.event_id || null,
+                campaign_id: order.campaign_id || null,
+                total_amount: Number(order.total_amount),
             };
             if (order.status === 'paid' && kind === 'tickets') {
                 body.tickets = await loadTickets(order);
@@ -928,6 +933,7 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
                 body.fully_paid = Number(parent.amount_paid) >= Number(parent.total_amount);
                 body.amount_paid = Number(parent.amount_paid);
                 body.total_amount = Number(parent.total_amount);
+                body.installments_total = Number(parent.meta?.installment?.count) || 3;
             }
             return res.json(body);
         } catch (err) {
