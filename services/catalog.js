@@ -171,8 +171,8 @@ function registerCatalogRoutes(app, { supabase }) {
 
     /**
      * GET /api/public/highlights?country=…  — derniers événements terminés, pour
-     * que l'accueil ne soit jamais vide quand rien n'est à venir. Si le pays n'en
-     * a pas, on prend ceux de tous les pays.
+     * que l'accueil ne soit jamais vide quand rien n'est à venir. Ceux du pays
+     * choisi seulement (tous les pays pour « Global »).
      */
     app.get('/api/public/highlights', async (req, res) => {
         try {
@@ -190,8 +190,8 @@ function registerCatalogRoutes(app, { supabase }) {
                     if (error) throw error;
                     return data || [];
                 };
-                const local = country !== 'Global' ? await run(true) : [];
-                return local.length > 0 ? local : run(false);
+                // Uniquement le pays choisi : montrer ceux d'un autre pays faisait croire qu'ils se passaient ici.
+                return run(country !== 'Global');
             });
             setPublicCache(res, 300, 600);
             return res.json({ success: true, events });
