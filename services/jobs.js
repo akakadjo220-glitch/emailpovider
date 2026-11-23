@@ -125,6 +125,7 @@ function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
         { name: 'event-lifecycle', minIntervalS: 3500, ttlS: 1800, run: runEventLifecycle },
         { name: 'event-reminders', minIntervalS: 3500, ttlS: 1800, run: runReminders },
         { name: 'tontine-overdue', minIntervalS: 3500, ttlS: 600, run: runOverdueInstallments },
+        { name: 'tontine-reminders', minIntervalS: 3500, ttlS: 600, run: runInstallmentReminders },
         { name: 'purge-operational-data', minIntervalS: 86000, ttlS: 600, run: runPurge },
         { name: 'ensure-archive-partitions', minIntervalS: 86000, ttlS: 300, run: runEnsurePartitions },
         // Alertes d'exploitation (paiements bloqués, e-mails en panne…) : voir services/alerts.js.
@@ -281,16 +282,42 @@ function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
             const text = `Votre échéance Tontine pour « ${title} » est dépassée : le billet a été annulé.\n\n`
                 + `Les ${amount(c.amount)} déjà versés ne sont pas perdus : ils deviennent un avoir à utiliser sur Babipass.\n`
                 + `Code avoir : ${c.code}\n\nSaisissez ce code au moment de payer votre prochain billet.`;
-            const row = c.contact_method === 'wa' && c.buyer_phone
-                ? { table: 'whatsapp_queue', data: { phone: c.buyer_phone, message: text } }
-                : c.buyer_email
-                    ? { table: 'email_queue', data: { to_email: c.buyer_email, subject: `Votre avoir Babipass : ${c.code}`, html_body: `<p>${escapeHtml(text).replace(/\n/g, '<br>')}</p>`, dedupe_key: `credit:${c.code}` } }
-                    : null;
-            if (!row) continue;
-            const { error: qErr } = await supabase.from(row.table).insert(row.data);
-            if (qErr) console.error(`[Tontine] Avertissement non envoyé pour l'avoir ${c.code} :`, qErr.message);
+            await messageBuyer(c, `Votre avoir Babipass : ${c.code}`, text, `credit:${c.code}`);
         }
         console.log(`[Tontine] ${credits.length} achat(s) annulé(s) après échéance, avoir(s) envoyé(s)`);
+    }
+
+    /** Tontine : rappel 2 jours avant chaque échéance, par WhatsApp ou e-mail selon le contact choisi à l'achat. */
+    async function runInstallmentReminders() {
+        // La base marque chaque rappel comme envoyé : un acheteur ne le reçoit qu'une fois par tranche.
+        const { data: reminders, error } = await supabase.rpc('due_installment_reminders');
+        if (error) throw error;
+        if (!reminders?.length) return;
+        const eventIds = [...new Set(reminders.map(r => r.event_id))];
+        const { data: events } = await supabase.from('events').select('id, title').in('id', eventIds);
+        const titles = Object.fromEntries((events || []).map(e => [e.id, e.title]));
+
+        for (const r of reminders) {
+            const title = titles[r.event_id] || 'votre événement';
+            const due = new Date(r.due).toLocaleString('fr-FR', { timeZone: 'Africa/Abidjan', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' });
+            const text = `⏰ Rappel Tontine : votre tranche ${r.tranche}/${r.count} de ${Number(r.amount).toLocaleString('fr-FR')} FCFA pour « ${title} » est à payer avant le ${due}.\n\n`
+                + `Payez-la depuis « Mes billets » : https://babipass.com/tickets\n\n`
+                + `Sans paiement, le billet sera annulé et les sommes déjà versées vous seront rendues en avoir.`;
+            await messageBuyer(r, `Rappel : tranche ${r.tranche}/${r.count} à payer avant le ${due}`, text, `tontine-reminder:${r.order_id}:${r.tranche}`);
+        }
+        console.log(`[Tontine] ${reminders.length} rappel(s) d'échéance mis en file`);
+    }
+
+    /** WhatsApp si l'acheteur a choisi WhatsApp, sinon e-mail. */
+    async function messageBuyer(buyer, subject, text, dedupeKey) {
+        const row = buyer.contact_method === 'wa' && buyer.buyer_phone
+            ? { table: 'whatsapp_queue', data: { phone: buyer.buyer_phone, message: text } }
+            : buyer.buyer_email
+                ? { table: 'email_queue', data: { to_email: buyer.buyer_email, subject, html_body: `<p>${escapeHtml(text).replace(/\n/g, '<br>')}</p>`, dedupe_key: dedupeKey } }
+                : null;
+        if (!row) return;
+        const { error } = await supabase.from(row.table).insert(row.data);
+        if (error) console.error(`[Tontine] Message non mis en file (${dedupeKey}) :`, error.message);
     }
 
     /** Reporte les compteurs de vues / clics répartis sur events.views et ambassador_links.clicks. */
