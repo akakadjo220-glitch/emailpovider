@@ -114,7 +114,11 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
             await supabase.rpc('release_order', { p_order_id: order.id, p_status: 'failed', p_reason: initErr.message });
             return res.status(502).json({ success: false, error: initErr.message });
         }
-        const { error: refError } = await supabase.from('orders').update({ provider_ref: initiated.providerRef }).eq('id', order.id);
+        // L'opérateur choisi (wave, orange…) sert au suivi des abandons par moyen de paiement.
+        const network = payment?.network ? String(payment.network).slice(0, 64) : null;
+        const { error: refError } = await supabase.from('orders')
+            .update({ provider_ref: initiated.providerRef, ...(network && { meta: { ...(order.meta || {}), network } }) })
+            .eq('id', order.id);
         if (refError) throw refError;
 
         return res.status(201).json({ success: true, order: orderBody(order, provider), payment: initiated.client });
