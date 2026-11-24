@@ -20,7 +20,10 @@ const MAX_ATTEMPTS = 5;
 const QUEUE_BATCH = Number(process.env.QUEUE_BATCH || 50);
 const EMAIL_CONCURRENCY = Number(process.env.EMAIL_CONCURRENCY || 5);
 const WHATSAPP_CONCURRENCY = Number(process.env.WHATSAPP_CONCURRENCY || 3);
+// File vide : on espace les vérifications (2 s → 10 s max) ; dès qu'un message arrive, retour à 2 s.
+// Un billet ou un code peut donc attendre jusqu'à 10 s quand rien n'a été envoyé depuis un moment.
 const IDLE_POLL_MS = 2000;
+const IDLE_POLL_MAX_MS = 10000;
 const SCHEDULER_TICK_MS = 15 * 1000;
 const PAGE_SIZE = 1000;
 
@@ -102,6 +105,7 @@ function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
 
     function startQueueLoop(queue, handler, concurrency) {
         const loop = (async () => {
+            let wait = IDLE_POLL_MS;
             while (running) {
                 let processed = 0;
                 try {
@@ -110,7 +114,9 @@ function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
                     console.error(`[${queue}] Boucle :`, err.message);
                 }
                 // Lot plein : on enchaîne ; sinon on attend avant de revérifier.
-                if (processed < QUEUE_BATCH) await idle(IDLE_POLL_MS);
+                if (processed >= QUEUE_BATCH) continue;
+                wait = processed > 0 ? IDLE_POLL_MS : Math.min(wait * 2, IDLE_POLL_MAX_MS);
+                await idle(wait);
             }
         })();
         loops.push(loop);
@@ -281,7 +287,9 @@ function createWorker({ supabase, getSetting, dispatchWhatsApp, checkout }) {
             const title = titles[c.event_id] || 'votre événement';
             const text = `Votre échéance Tontine pour « ${title} » est dépassée : le billet a été annulé.\n\n`
                 + `Les ${amount(c.amount)} déjà versés ne sont pas perdus : ils deviennent un avoir à utiliser sur Babipass.\n`
-                + `Code avoir : ${c.code}\n\nSaisissez ce code au moment de payer votre prochain billet.`;
+                + `Code avoir : ${c.code}\n`
+                + (c.expires_at ? `Valable jusqu'au ${new Date(c.expires_at).toLocaleDateString('fr-FR', { day: 'numeric', month: 'long', year: 'numeric' })}.\n` : '')
+                + `\nSaisissez ce code au moment de payer votre prochain billet.`;
             await messageBuyer(c, `Votre avoir Babipass : ${c.code}`, text, `credit:${c.code}`);
         }
         console.log(`[Tontine] ${credits.length} achat(s) annulé(s) après échéance, avoir(s) envoyé(s)`);

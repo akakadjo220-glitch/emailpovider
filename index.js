@@ -885,19 +885,26 @@ const WALLET_SECRET = process.env.WALLET_TOKEN_SECRET || SUPABASE_SERVICE_ROLE_K
 const walletSign = payload => crypto.createHmac('sha256', WALLET_SECRET).update(`wallet:${payload}`).digest('base64url');
 
 function issueWalletToken(contact) {
-    const payload = Buffer.from(JSON.stringify({ c: contact, exp: Date.now() + WALLET_TTL_MS })).toString('base64url');
+    const now = Date.now();
+    const payload = Buffer.from(JSON.stringify({ c: contact, iat: now, exp: now + WALLET_TTL_MS })).toString('base64url');
     return `${payload}.${walletSign(payload)}`;
 }
 
-function readWalletToken(token) {
+// Même clé pour un contact quelle que soit sa forme : e-mail en minuscules, téléphone en chiffres seuls.
+const walletKey = contact => (String(contact).includes('@') ? String(contact).trim().toLowerCase() : String(contact).replace(/\D/g, ''));
+
+/** Contact du jeton s'il est signé, non expiré et émis après la dernière « déconnexion de tous les appareils ». */
+async function readWalletToken(token) {
     const [payload, sig] = String(token || '').split('.');
     if (!payload || !sig) return null;
     const expected = walletSign(payload);
     if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
-    try {
-        const { c, exp } = JSON.parse(Buffer.from(payload, 'base64url').toString());
-        return c && exp > Date.now() ? c : null;
-    } catch { return null; }
+    let c, iat, exp;
+    try { ({ c, iat = 0, exp } = JSON.parse(Buffer.from(payload, 'base64url').toString())); } catch { return null; }
+    if (!c || !(exp > Date.now())) return null;
+    const { data, error } = await supabase.from('wallet_revocations').select('revoked_before').eq('contact', walletKey(c)).maybeSingle();
+    if (error) throw error;
+    return data && iat < new Date(data.revoked_before).getTime() ? null : c;
 }
 
 async function walletContents(contact) {
@@ -926,13 +933,35 @@ app.post('/api/tickets/recover/verify', async (req, res) => {
 /** GET /api/tickets/mine (Authorization: Bearer <jeton>) — billets et avoirs à jour du contact vérifié. */
 app.get('/api/tickets/mine', async (req, res) => {
     try {
-        const contact = readWalletToken(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
+        const contact = await readWalletToken(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
         if (!contact) return res.status(401).json({ success: false, error: 'Session expirée : vérifiez à nouveau votre contact.' });
         res.set('Cache-Control', 'no-store');
         return res.status(200).json({ success: true, ...(await walletContents(contact)), contact });
     } catch (err) {
         console.error('[Tickets mine] Error:', err);
         return res.status(500).json({ success: false, error: 'Billets indisponibles pour le moment.' });
+    }
+});
+
+/**
+ * POST /api/tickets/sessions/revoke (Authorization: Bearer <jeton>)
+ * Déconnecte tous les autres téléphones reliés à ce contact (téléphone perdu, prêté…).
+ * Le téléphone qui le demande reçoit un nouveau jeton et reste connecté.
+ */
+app.post('/api/tickets/sessions/revoke', async (req, res) => {
+    try {
+        const contact = await readWalletToken(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
+        if (!contact) return res.status(401).json({ success: false, error: 'Session expirée : vérifiez à nouveau votre contact.' });
+        const revokedBefore = new Date();
+        const { error } = await supabase.from('wallet_revocations')
+            .upsert({ contact: walletKey(contact), revoked_before: revokedBefore.toISOString() }, { onConflict: 'contact' });
+        if (error) throw error;
+        // Nouveau jeton émis après la date de révocation (attente d'1 ms pour ne pas tomber à la même milliseconde).
+        await new Promise(r => setTimeout(r, 2));
+        return res.status(200).json({ success: true, token: issueWalletToken(contact), contact });
+    } catch (err) {
+        console.error('[Tickets sessions revoke] Error:', err);
+        return res.status(500).json({ success: false, error: 'Déconnexion impossible pour le moment.' });
     }
 });
 
