@@ -12,7 +12,7 @@ const crypto = require('crypto');
 const AGENT_TOKEN_TTL_S = 12 * 60 * 60;
 const MAX_SYNC_BATCH = 500;
 
-function registerScannerRoutes(app, { supabase, enqueueEmail, rateLimit }) {
+function registerScannerRoutes(app, { supabase, enqueueEmail, rateLimit, checkout }) {
     const TOKEN_SECRET = process.env.AGENT_TOKEN_SECRET
         || crypto.createHash('sha256').update(`agent-token:${process.env.SUPABASE_SERVICE_ROLE_KEY}`).digest('hex');
 
@@ -27,6 +27,15 @@ function registerScannerRoutes(app, { supabase, enqueueEmail, rateLimit }) {
         windowMs: 15 * 60 * 1000,
         max: 10,
         message: { success: false, error: 'Trop de transferts. Réessayez plus tard.' },
+        standardHeaders: true,
+        legacyHeaders: false,
+    });
+
+    // Guichet : un agent peut enchaîner les ventes (file d'attente à l'entrée).
+    const posSaleLimiter = rateLimit({
+        windowMs: 15 * 60 * 1000,
+        max: 300,
+        message: { success: false, error: 'Trop de ventes en peu de temps. Patientez un instant.' },
         standardHeaders: true,
         legacyHeaders: false,
     });
@@ -95,6 +104,57 @@ function registerScannerRoutes(app, { supabase, enqueueEmail, rateLimit }) {
             console.error('[Agent login] Error:', err);
             return res.status(500).json({ success: false, error: 'Erreur serveur lors de la connexion.' });
         }
+    });
+
+    // ─── Guichet : vente en espèces (agent POS) ──────────────────────────
+
+    function requirePos(req, res, next) {
+        if (req.agent?.typ !== 'POS') return res.status(403).json({ success: false, error: "Ce compte agent n'est pas autorisé à vendre au guichet." });
+        return next();
+    }
+
+    function sendSqlError(res, error, fallback) {
+        const mapped = checkout?.mapSqlError(error);
+        if (mapped) return res.status(mapped.status).json({ success: false, error: mapped.error, code: mapped.code });
+        console.error('[Guichet]', fallback, error);
+        return res.status(500).json({ success: false, error: fallback });
+    }
+
+    /** GET /api/agent/pos — événements que l'agent peut vendre, catégories, cash détenu. */
+    app.get('/api/agent/pos', requireAgent, requirePos, async (req, res) => {
+        const { data, error } = await supabase.rpc('agent_pos_context', { p_agent_id: req.agent.sub });
+        if (error) return sendSqlError(res, error, 'Guichet indisponible pour le moment.');
+        res.set('Cache-Control', 'no-store');
+        return res.json({ success: true, ...data });
+    });
+
+    /**
+     * POST /api/agent/sales { event_id, items: {ticketTypeId: qty}, buyer: { name?, phone } }
+     * Vente en espèces : la base vérifie l'agent, l'événement, le stock et couvre la commission
+     * Babipass (solde en ligne ou crédit guichet de l'organisateur) avant d'émettre les billets.
+     */
+    app.post('/api/agent/sales', posSaleLimiter, requireAgent, requirePos, async (req, res) => {
+        const { event_id, items, buyer = {} } = req.body || {};
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const itemList = Object.entries(items && typeof items === 'object' ? items : {})
+            .map(([id, qty]) => ({ id, qty: Number(qty) })).filter(i => i.qty > 0);
+        const phone = String(buyer.phone || '').replace(/[^\d]/g, '');
+        if (!uuid.test(String(event_id || '')) || !itemList.length || itemList.some(i => !uuid.test(i.id) || !Number.isInteger(i.qty) || i.qty > 50)) {
+            return res.status(400).json({ success: false, error: 'Vente invalide.' });
+        }
+        if (!/^\d{8,15}$/.test(phone)) {
+            return res.status(400).json({ success: false, error: "Numéro WhatsApp de l'acheteur invalide (indicatif compris)." });
+        }
+        const { data, error } = await supabase.rpc('agent_cash_sale', {
+            p_agent_id: req.agent.sub,
+            p_event_id: event_id,
+            p_items: itemList,
+            p_buyer: { name: String(buyer.name || '').slice(0, 200) || null, phone, contact_method: 'wa' },
+        });
+        if (error) return sendSqlError(res, error, "La vente n'a pas pu être enregistrée.");
+        // Billets envoyés par WhatsApp ; un échec d'envoi n'annule pas la vente (billets visibles via « Retrouver mes billets »).
+        checkout?.notifyOrder(data.order_id).catch(err => console.error('[Guichet] Envoi des billets échoué:', err.message));
+        return res.status(201).json({ success: true, sale: data });
     });
 
     /** POST /api/scanner/scan { code } — code = identifiant du billet ou contenu du QR */

@@ -39,6 +39,9 @@ const CHECKOUT_ERRORS = {
     CREDIT_FULL_ONLY: "L'avoir s'utilise pour un paiement en une fois.",
     NOT_EVENT_ORGANIZER: "Cet événement ne vous appartient pas.",
     INVALID_CATEGORY: 'Catégorie de billet invalide.',
+    POS_CREDIT_EXHAUSTED: "Crédit guichet épuisé : l'organisateur doit recharger son crédit pour continuer les ventes en espèces.",
+    AGENT_NOT_POS: "Ce compte agent n'est pas autorisé à vendre au guichet.",
+    AGENT_WRONG_EVENT: "Cet événement n'est pas attribué à votre guichet.",
 };
 
 function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateLimit, admission, metrics, getAuthenticatedUser }) {
@@ -85,7 +88,8 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
         const message = String(err?.message || '');
         const code = Object.keys(CHECKOUT_ERRORS).find(k => message.includes(k));
         if (!code) return null;
-        const status = code === 'SOLD_OUT' || code === 'INSTALLMENT_PENDING' ? 409 : code === 'NOT_EVENT_ORGANIZER' ? 403 : 400;
+        const status = ['SOLD_OUT', 'INSTALLMENT_PENDING', 'POS_CREDIT_EXHAUSTED'].includes(code) ? 409
+            : ['NOT_EVENT_ORGANIZER', 'AGENT_NOT_POS', 'AGENT_WRONG_EVENT'].includes(code) ? 403 : 400;
         return { status, error: CHECKOUT_ERRORS[code], code };
     }
 
@@ -877,6 +881,25 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
     });
 
     /** POST /api/physical/commission-orders { event_id, category_id, quantity, provider, payment } */
+    /**
+     * POST /api/pos-credit/orders { amount, provider, payment } — organisateur connecté.
+     * Recharge du crédit guichet : il couvre la commission Babipass des ventes en espèces de ses agents.
+     */
+    app.post('/api/pos-credit/orders', checkoutLimiter, async (req, res) => {
+        try {
+            const user = await getAuthenticatedUser(req);
+            if (!user) return res.status(401).json({ success: false, error: 'Authentification requise.' });
+            return await createAndPay(res, 'create_pos_credit_order', {
+                p_organizer_id: user.id,
+                p_amount: Number(req.body?.amount),
+                p_buyer: { name: user.user_metadata?.name || null, email: user.email || null, contact_method: 'email' },
+            }, req.body?.provider, req.body?.payment);
+        } catch (err) {
+            console.error('[Guichet] Recharge du crédit échouée:', err);
+            return res.status(500).json({ success: false, error: 'Impossible de lancer la recharge.' });
+        }
+    });
+
     app.post('/api/physical/commission-orders', checkoutLimiter, async (req, res) => {
         try {
             const user = await requireOrganizer(req, res);
@@ -1070,7 +1093,13 @@ function registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmail, rateL
         }
     }
 
-    return { reconcile };
+    /** Billets d'une commande déjà payée envoyés à l'acheteur (vente au guichet). */
+    async function notifyOrder(orderId) {
+        const order = await getOrder(orderId);
+        if (order?.status === 'paid') await notifyBuyer(order, await loadTickets(order));
+    }
+
+    return { reconcile, notifyOrder, mapSqlError };
 }
 
 module.exports = { registerCheckoutRoutes };

@@ -741,6 +741,25 @@ app.post('/api/auth/otp/verify', async (req, res) => {
         }
         const ok = await verifyOtp(identifier, purpose, req.body.code, { consume: true });
         if (!ok) return res.status(400).json({ success: false, error: 'Code incorrect ou expiré.' });
+        // Ambassadeur : adresse vérifiée → e-mail de bienvenue (un échec d'envoi ne bloque pas l'inscription).
+        if (purpose === 'ambassador') {
+            const firstName = escapeHtml(String(req.body.name || '').trim().split(' ')[0] || 'Ambassadeur');
+            enqueueEmail(identifier, '🎁 Bienvenue dans le programme Ambassadeur Babipass',
+                `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#0f172a">
+                  <div style="background:linear-gradient(135deg,#7c3aed,#4f46e5);color:#fff;border-radius:16px 16px 0 0;padding:20px 24px;font-weight:800;font-size:18px">🎁 Babipass Ambassadeur</div>
+                  <div style="border:1px solid #e2e8f0;border-top:0;border-radius:0 0 16px 16px;padding:24px">
+                    <h1 style="font-size:20px;margin:0 0 12px">Bienvenue, ${firstName} !</h1>
+                    <p>Votre compte ambassadeur est actif. Gagnez une commission sur chaque billet vendu grâce à vous :</p>
+                    <ol>
+                      <li>Ouvrez la page d'un événement qui propose le programme ambassadeur.</li>
+                      <li>Générez votre lien personnel.</li>
+                      <li>Partagez-le sur WhatsApp, Facebook, TikTok…</li>
+                    </ol>
+                    <p>Vous recevrez un e-mail à chaque vente, et vous pourrez retirer vos gains en Mobile Money dès 5 000 FCFA.</p>
+                    <p style="margin:24px 0 0"><a href="https://babipass.com/ambassador" style="background:#4f46e5;color:#fff;text-decoration:none;font-weight:700;padding:12px 20px;border-radius:10px;display:inline-block">Mon espace ambassadeur</a></p>
+                  </div>
+                </div>`).catch(err => console.error('[Ambassadeur] Bienvenue non envoyée:', err.message));
+        }
         return res.status(200).json({ success: true });
     } catch (err) {
         console.error('[OTP verify] Error:', err);
@@ -1000,7 +1019,7 @@ const checkout = registerCheckoutRoutes(app, { supabase, getSetting, enqueueEmai
 
 // Agents (connexion par jeton signé), scanner et transfert de billet.
 const { registerScannerRoutes } = require('./services/scanner');
-registerScannerRoutes(app, { supabase, enqueueEmail, rateLimit: sharedRateLimit });
+registerScannerRoutes(app, { supabase, enqueueEmail, rateLimit: sharedRateLimit, checkout });
 
 // Catalogue public cacheable (liste, carte, page événement).
 const { registerCatalogRoutes } = require('./services/catalog');
